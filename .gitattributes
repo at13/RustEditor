@@ -1,0 +1,4 @@
+# Shell scripts and desktop entries must keep LF endings (a CR breaks them
+# on Linux/macOS even when checked out on Windows).
+*.sh text eol=lf
+*.desktop text eol=lf

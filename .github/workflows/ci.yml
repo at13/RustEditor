@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail the build if the Windows release binary grows past this (bytes).
+  # Phase 1 baseline: 8,721,920 bytes. Raised after Phase 6 (9,126,912
+  # bytes) to 10 MB (~1.4 MB is image/SVG decoders gpui 0.2.2 always
+  # includes), and after Phase 8 (10,564,608 bytes: +1.39 MB for the wasmi
+  # plugin sandbox) to 11 MB. A build without WASM plugins
+  # (`cargo build --release --no-default-features`) avoids that cost.
+  # Phase 9 (huge files): 10,652,672 bytes.
+  SIZE_BUDGET_BYTES: 11000000
+
+jobs:
+  check:
+    name: fmt / clippy / test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    # macOS and Linux now get their GPUI backends (see Cargo.toml target
+    # sections) but have never been run. Keep them informational until a
+    # first green run; then remove this line.
+    continue-on-error: ${{ matrix.os != 'windows-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libvulkan-dev libfontconfig-dev libfreetype-dev \
+            libx11-xcb-dev libxcb1-dev libgtk-3-dev libssl-dev             desktop-file-utils
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --quiet
+      - name: Core crates must not depend on the UI
+        shell: bash
+        run: |
+          for crate in re-core re-commands re-search re-tasks re-view re-platform re-plugin re-ext-transforms re-ext-calculator; do
+            if cargo tree -e normal -p "$crate" | grep -Eq '\b(gpui|rfd)\b'; then
+              echo "$crate depends on a UI crate"; exit 1
+            fi
+          done
+      - name: Example WASM plugin runs in the sandbox
+        shell: bash
+        run: |
+          rustup target add wasm32-unknown-unknown
+          (cd plugins/examples/sort-lines && cargo build --release --target wasm32-unknown-unknown)
+          cargo test -p re-plugin --test example_plugin -- --ignored
+      - name: Builds without WASM plugins
+        run: cargo check --no-default-features
+      - name: Validate Linux packaging
+        if: runner.os == 'Linux'
+        run: |
+          desktop-file-validate packaging/linux/rusteditor.desktop
+          sh -n scripts/install.sh
+          sh -n scripts/uninstall.sh
+
+  size:
+    name: release size budget (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Check binary size
+        shell: pwsh
+        run: |
+          $size = (Get-Item target/release/rusteditor.exe).Length
+          Write-Host "rusteditor.exe: $size bytes (budget $env:SIZE_BUDGET_BYTES)"
+          if ($size -gt [int64]$env:SIZE_BUDGET_BYTES) {
+            Write-Error "Release binary exceeds size budget"
+            exit 1
+          }

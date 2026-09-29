@@ -1,0 +1,18 @@
+[package]
+name = "re-plugin"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[features]
+default = ["wasm"]
+# Sandboxed WebAssembly plugins (adds the wasmi interpreter, ~0.5-1 MB).
+wasm = ["dep:wasmi"]
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+wasmi = { version = "0.51.5", default-features = false, features = ["std"], optional = true }
+
+[dev-dependencies]
+wat = "1.259.0"

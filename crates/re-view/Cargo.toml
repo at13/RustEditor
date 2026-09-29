@@ -1,0 +1,9 @@
+[package]
+name = "re-view"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+re-core.workspace = true
+ropey.workspace = true

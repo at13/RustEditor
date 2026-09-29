@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=RustEditor
+GenericName=Text Editor
+Comment=Fast editor for very large text files
+Exec=rusteditor %F
+Terminal=false
+Categories=Utility;TextEditor;Development;
+MimeType=text/plain;text/x-log;application/json;text/csv;text/markdown;application/xml;
+StartupNotify=true
+StartupWMClass=RustEditor
+Keywords=text;editor;log;json;

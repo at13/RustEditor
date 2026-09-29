@@ -1,0 +1,88 @@
+[package]
+name = "rusteditor"
+version.workspace = true
+edition.workspace = true
+
+# macOS app bundle (`cargo bundle --release`); see packaging/macos/README.md.
+[package.metadata.bundle]
+name = "RustEditor"
+identifier = "dev.rusteditor.RustEditor"
+category = "public.app-category.developer-tools"
+short_description = "Fast editor for very large text files"
+osx_minimum_system_version = "11.0"
+
+[[package.metadata.bundle.document_types]]
+name = "Text"
+role = "Editor"
+extensions = ["txt", "log", "json", "csv", "md", "xml", "yaml", "yml", "toml", "ini", "cfg", "rs"]
+mime_types = ["text/plain"]
+
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+# Shared versions so every crate uses the same rope, regex, etc.
+[workspace.dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+heck = "0.5.0"
+memchr = "2.7"
+regex = "1.13.1"
+ropey = "1.6.1"
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+re-commands = { path = "crates/re-commands" }
+re-core = { path = "crates/re-core" }
+re-platform = { path = "crates/re-platform" }
+re-plugin = { path = "crates/re-plugin", default-features = false }
+re-search = { path = "crates/re-search" }
+re-tasks = { path = "crates/re-tasks" }
+re-view = { path = "crates/re-view" }
+re-ext-transforms = { path = "crates/re-ext-transforms" }
+re-ext-calculator = { path = "crates/re-ext-calculator" }
+
+[features]
+default = ["wasm-plugins"]
+# Sandboxed WebAssembly plugins (~1.4 MB). Build without them with
+# `cargo build --release --no-default-features`.
+wasm-plugins = ["re-plugin/wasm"]
+
+[dependencies]
+anyhow.workspace = true
+gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
+re-commands.workspace = true
+re-core.workspace = true
+re-ext-calculator.workspace = true
+re-ext-transforms.workspace = true
+re-platform.workspace = true
+re-plugin.workspace = true
+re-search.workspace = true
+re-tasks.workspace = true
+re-view.workspace = true
+rfd = "0.17.2"
+ropey.workspace = true
+
+# GPUI is built without default features (keeps the Windows binary small),
+# so each platform must enable its own text/window backends. Without these,
+# macOS falls back to a no-op text system (no text) and Linux has no window
+# backend (panics at startup).
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "wayland", "x11"] }
+
+[dev-dependencies]
+gpui = { version = "=0.2.2", default-features = false, features = ["test-support", "windows-manifest"] }
+wat = "1.259.0"
+
+# Size-focused release profile. `panic = "abort"` is deliberately NOT used:
+# `re_tasks::spawn` catches worker panics so one tab fails instead of the
+# whole process (and unsaved work in other tabs).
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true

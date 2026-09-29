@@ -1,0 +1,15 @@
+{
+  "api": 0,
+  "id": "sort-lines",
+  "name": "Sort Lines",
+  "version": "1.0.0",
+  "kind": "wasm",
+  "module": "sort_lines.wasm",
+  "capabilities": [],
+  "commands": [
+    { "id": "sort", "title": "Sort Lines", "input": "selection", "output": "replace" },
+    { "id": "sort-reverse", "title": "Sort Lines Descending", "input": "selection", "output": "replace" },
+    { "id": "unique", "title": "Remove Duplicate Lines", "input": "selection", "output": "replace" },
+    { "id": "stats", "title": "Selection Statistics", "input": "selection", "output": "show" }
+  ]
+}

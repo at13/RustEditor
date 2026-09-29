@@ -1,0 +1,10 @@
+[package]
+name = "re-search"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+regex.workspace = true
+ropey.workspace = true

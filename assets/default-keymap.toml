@@ -1,0 +1,107 @@
+# RustEditor default keymap.
+#
+# Copy entries into your user keymap to change them (Command Palette ->
+# "Open Keymap File", then "Reload Keymap"). User entries with the same
+# section and keystroke replace these; "" removes a binding.
+#
+# `mod` is Ctrl on Windows/Linux and Cmd on macOS. Keys and command ids must
+# be quoted. Sections: [global] (always active) and [editor] (text input has
+# focus). Command ids are listed in the Command Palette.
+
+[global]
+"mod-n" = "file.new"
+"mod-o" = "file.open"
+"mod-s" = "file.save"
+"mod-shift-s" = "file.save_as"
+"mod-z" = "edit.undo"
+"mod-y" = "edit.redo"
+"mod-shift-z" = "edit.redo"
+"mod-a" = "edit.select_all"
+"mod-f" = "search.find"
+"mod-h" = "search.replace"
+"f3" = "search.next"
+"shift-f3" = "search.previous"
+"mod-g" = "edit.go_to_line"
+"mod-shift-p" = "app.command_palette"
+"f1" = "app.command_palette"
+"alt-z" = "view.toggle_word_wrap"
+
+[editor]
+"enter" = "editor.newline"
+"backspace" = "editor.backspace"
+"delete" = "editor.delete"
+"left" = "editor.left"
+"right" = "editor.right"
+"shift-left" = "editor.select_left"
+"shift-right" = "editor.select_right"
+"up" = "editor.up"
+"down" = "editor.down"
+"shift-up" = "editor.select_up"
+"shift-down" = "editor.select_down"
+"mod-left" = "editor.word_left"
+"mod-right" = "editor.word_right"
+"mod-shift-left" = "editor.select_word_left"
+"mod-shift-right" = "editor.select_word_right"
+"pageup" = "editor.page_up"
+"pagedown" = "editor.page_down"
+"shift-pageup" = "editor.select_page_up"
+"shift-pagedown" = "editor.select_page_down"
+"home" = "editor.home"
+"end" = "editor.end"
+"shift-home" = "editor.select_home"
+"shift-end" = "editor.select_end"
+"mod-home" = "editor.doc_start"
+"mod-end" = "editor.doc_end"
+"mod-shift-home" = "editor.select_doc_start"
+"mod-shift-end" = "editor.select_doc_end"
+"mod-alt-up" = "edit.add_cursor_above"
+"mod-alt-down" = "edit.add_cursor_below"
+"escape" = "editor.cancel"
+"mod-c" = "edit.copy"
+"mod-x" = "edit.cut"
+"mod-v" = "edit.paste"
+
+# macOS conventions. `mod` is Cmd here, so the plain sections above give
+# Cmd+Left for word motion; macOS uses Option for words and Cmd for lines.
+[global.macos]
+"mod-h" = ""                      # Cmd+H is "Hide" on macOS
+"mod-alt-f" = "search.replace"
+"mod-y" = ""                      # redo is Cmd+Shift+Z
+"mod-g" = "search.next"           # Cmd+G is Find Next on macOS
+"mod-l" = "edit.go_to_line"
+
+[editor.macos]
+"alt-left" = "editor.word_left"
+"alt-right" = "editor.word_right"
+"alt-shift-left" = "editor.select_word_left"
+"alt-shift-right" = "editor.select_word_right"
+"mod-left" = "editor.home"
+"mod-right" = "editor.end"
+"mod-shift-left" = "editor.select_home"
+"mod-shift-right" = "editor.select_end"
+"mod-up" = "editor.doc_start"
+"mod-down" = "editor.doc_end"
+"mod-shift-up" = "editor.select_doc_start"
+"mod-shift-down" = "editor.select_doc_end"
+
+# Alt+letter opens a menu (the underlined letter). Not on macOS, where
+# Option+letter types characters and the menu bar is reached differently.
+[global.windows]
+"alt-f" = "app.menu.file"
+"alt-e" = "app.menu.edit"
+"alt-s" = "app.menu.search"
+"alt-v" = "app.menu.view"
+"alt-t" = "app.menu.transform"
+"alt-b" = "app.menu.bookmarks"
+"alt-o" = "app.menu.tools"
+"alt-p" = "app.menu.plugins"
+
+[global.linux]
+"alt-f" = "app.menu.file"
+"alt-e" = "app.menu.edit"
+"alt-s" = "app.menu.search"
+"alt-v" = "app.menu.view"
+"alt-t" = "app.menu.transform"
+"alt-b" = "app.menu.bookmarks"
+"alt-o" = "app.menu.tools"
+"alt-p" = "app.menu.plugins"
