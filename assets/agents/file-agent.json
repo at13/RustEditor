@@ -1,0 +1,12 @@
+{
+  "api": 0,
+  "id": "file-agent",
+  "name": "File Agent",
+  "version": "0.1.0",
+  "kind": "agent",
+  "scope": "file",
+  "system_prompt": "file-agent.md",
+  "tools": ["read_buffer", "edit_buffer", "read_file", "list_dir", "search", "write_file", "create_file"],
+  "provider": null,
+  "commands": [{ "id": "open", "title": "Open File Agent" }]
+}

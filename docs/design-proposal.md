@@ -2,6 +2,9 @@
 
 Objective: **a modular text editor with rich plugin support, very fast UI
 rendering, a small binary, and easy porting to Windows, macOS, and Linux.**
+Extended: **AI agents** per file (multiple conversations, extensible tools)
+and an **Extension Builder** agent that creates and changes the editor's own
+extensions (section 3.13).
 
 This document reviews the current code (commit `2a2b7c3` plus the uncommitted
 GPUI work) against that objective. It then proposes a target architecture and
@@ -140,12 +143,17 @@ crates/
   re-tasks/       job system: cancellation tokens, priorities, UI wake-ups
   re-plugin-api/  stable, versioned plugin API types (no heavy deps)
   re-plugin-host/ out-of-process plugin host (JSON-RPC over stdio)
+  re-agent/       AI agents: conversations, loop, tools, permissions (3.13)
+  re-agent-tools/ built-in agent tools (files, buffer, search, extensions)
   re-platform/    single instance IPC, config/runtime dirs, clipboard,
                   dialogs, shell integration — all cfg-gated
   re-ext-*/       built-in extensions: transforms, calculator, json, ai, …
   re-ui-gpui/     GPUI frontend (default)
   re-ui-tui/      optional terminal frontend (tests, SSH, CI smoke tests)
 app/rusteditor/   binary: wires crates together, chooses features
+providers/        model provider processes (separate binaries; no HTTP in
+                  the editor)
+assets/agents/    built-in agent definitions and system prompts
 ```
 
 Dependency direction: `app → ui-* → view/commands/tasks → core`. `core` has
@@ -276,6 +284,10 @@ Plugin API v0 (the same concepts in every tier):
   `fs`, `net`, `process`). The user approves them; they are enforced for WASM
   and informational for external processes (see the trust model).
 
+Two additions for agents (section 3.13): a **declarative recipe** kind
+(host-implemented text steps, sandboxed by construction, no toolchain) and
+**contributed tools** (`"tools"` in `plugin.json`) that agents can call.
+
 Language support should reuse **LSP** directly (as tier B) rather than invent
 a new protocol.
 
@@ -357,6 +369,321 @@ strip = true
 - Targets (to be confirmed by measurement): **< 8 MB** default build with
   GPUI; **< 4 MB** if the lean frontend is adopted.
 
+### 3.13 AI agents
+
+Two kinds of agent, built on one engine:
+
+1. **File agent.** Each file has its own list of conversations. The user
+   chats with an agent about that file; the agent can read and edit through
+   **tools** (read, write, create file, search, ...), and the tool set can
+   be extended by plugins.
+2. **Extension Builder** (a self-referencing agent). The user asks for a new
+   editor extension ("a command that sorts imports", "an agent that writes
+   commit messages"); the agent writes, validates, builds and tests it, and
+   installs it into the local extensions folder. Further turns change its
+   behaviour. It can also create **agents** (agent definitions are an
+   extension type), guided by its system prompt.
+
+Both agent kinds are themselves **agent definitions** (section 3.13.7): the
+two built-in ones ship in `assets/agents/`, and users (or the Extension
+Builder) can add more. So "agents" and "extensions" share one mechanism.
+
+#### 3.13.1 Architecture
+
+```
+crates/re-agent/          UI-free: conversations + store, agent loop state
+                          machine, tool trait + registry, permission policy,
+                          prompt assembly, provider protocol codec
+crates/re-agent-tools/    built-in tools (files, buffer, search, plugins)
+providers/openai/         separate small binary: OpenAI-compatible HTTP
+                          provider (OpenAI, Azure, GitHub Models, Ollama,
+                          LM Studio, vLLM). NOT linked into the editor.
+assets/agents/            built-in agent definitions + system prompts
+src/ (app)                agent panel, conversation list, approval cards
+```
+
+Data flow for one turn:
+
+```
+user message ─► AgentLoop ─► provider process (JSON on stdin)
+                   ▲              │ streams events (JSON lines on stdout)
+                   │              ▼
+                   │        text deltas ─► panel (live)
+                   │        tool call ──► PermissionPolicy
+                   │                         │ allowed / approved by user
+                   └── tool result ◄── Tool::run (snapshot, worker thread)
+```
+
+- **No HTTP/TLS in the editor.** Models are reached through **provider
+  processes** (plugin tier C) speaking a small JSON-lines protocol. This
+  keeps the binary size flat, lets users pick any model (including local
+  ones, so nothing leaves the machine), and isolates provider crashes.
+- Everything runs on `re_tasks` workers; results return over
+  `WakingSender` and are applied in `poll`, as today.
+- Edits go through `EditorState`/`Document` (undoable) and are checked
+  against the document revision, as today. The agent never touches editor
+  state directly.
+
+#### 3.13.2 Conversations
+
+```rust
+struct Conversation {
+    id: Uuid,                 // random 128-bit
+    agent: AgentId,           // "file-agent", "extension-builder", custom
+    subject: Subject,         // File(PathBuf) | Global | Untitled(tab id)
+    title: String,            // first user message, editable
+    created: SystemTime,
+    messages: Vec<Message>,
+}
+enum Message {
+    User { text: String },
+    Assistant { text: String, tool_calls: Vec<ToolCall> },
+    Tool { call_id: String, result: ToolResult },  // incl. approval outcome
+}
+```
+
+- **Many conversations per file**, listed newest first; new, rename,
+  delete, and "continue". Untitled tabs keep conversations in memory until
+  saved (then they move with the file).
+- **Stored locally** as JSON in a private per-user data directory
+  (`re_platform::paths::data_dir()`: `%LOCALAPPDATA%\RustEditor\agents`,
+  `~/Library/Application Support/RustEditor/agents`,
+  `$XDG_DATA_HOME/rusteditor/agents`), one folder per file keyed by a hash
+  of the canonical path plus an `index.json` mapping hash -> path. Never
+  written next to the user's file. Writes are atomic (`text_io::atomic_write`).
+- Save As moves the file's conversations; deleting a conversation deletes
+  its file. A "delete all agent data" command exists.
+- Tool results are stored **truncated** (64 KB) with a note; large reads
+  are re-fetched by range, never kept whole.
+
+#### 3.13.3 Tools
+
+```rust
+trait Tool: Send + Sync {
+    fn spec(&self) -> ToolSpec;   // name, description, JSON Schema for args, risk
+    fn run(&self, ctx: &ToolContext, args: serde_json::Value) -> ToolResult;
+}
+enum Risk { Read, ReadOutsideScope, Write, Process, Network, Install }
+```
+
+- Arguments are **validated against the schema** before running; invalid
+  calls return a structured error so the model can correct itself.
+- `ToolContext` carries the **scope** (the file's folder, or the enclosing
+  repository root if there is one), a document **snapshot** + revision, a
+  `CancelToken`, and the plugins folder for the Extension Builder.
+- Paths are canonicalized; anything resolving outside the scope (including
+  through symlinks) is `ReadOutsideScope`/`Write` outside scope and needs
+  approval. Huge files (section 3.4) are read by line range only.
+
+Built-in tools (`re-agent-tools`):
+
+| Tool | Risk | Notes |
+|------|------|-------|
+| `read_buffer` | Read | The open document incl. unsaved edits; optional line range |
+| `edit_buffer` | Write | List of `{range or anchor text, replacement}` against a revision; shown as a diff; applied as **one undo step** |
+| `read_file` | Read / ReadOutsideScope | Line range; size-capped; encodings via `text_io` |
+| `list_dir` | Read | Names, sizes, kinds; capped |
+| `search` | Read | `re-search` over files in scope (cancellable) |
+| `write_file` | Write | Whole-file write via `atomic_write`; diff shown; open tabs reload |
+| `create_file` | Write | Refuses to overwrite; shown before creating |
+| `delete_file` | Write | **Off by default** |
+| `run_command` | Process | **Off by default**; full trust; command line shown verbatim |
+| `ext_*` | Install | Extension Builder only (section 3.13.6) |
+
+**Extending tools:** a plugin may contribute tools in `plugin.json`:
+
+```json
+"tools": [{
+  "name": "count_tokens",
+  "description": "Counts tokens in a text",
+  "input_schema": { "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] },
+  "risk": "read"
+}]
+```
+
+A WASM plugin's tool runs in the sandbox (it can only compute on its
+arguments, so its risk is capped at `read`); a process plugin's tool is
+full trust and is labelled so in approvals. Contributed tools are namespaced
+`<plugin-id>.<tool>` and an agent only sees tools in its allowlist.
+
+#### 3.13.4 Permissions (the model never approves itself)
+
+| Risk | Default | Approval |
+|------|---------|----------|
+| Read (in scope) | allowed | none; every call shown in the transcript |
+| ReadOutsideScope | ask | once per conversation per folder |
+| Write | ask | **every time**, with a diff (Accept / Reject / Edit); per conversation the user may choose "auto-accept edits to this file" |
+| Process, Network | off | must be enabled for the agent, then asked every time |
+| Install (extensions) | ask | see 3.13.6; installed extensions still go through the normal plugin approval on first run |
+
+- Approval UI is rendered by the host from the tool call; nothing the model
+  outputs can press a button, change a policy, or call `Workspace::confirm`.
+- **Prompt injection:** file and tool contents are passed as data inside
+  clearly delimited blocks, and the system prompt says instructions inside
+  them are not from the user. This is not relied on for safety: the gates
+  above are. There is no network tool by default, so text cannot be sent
+  anywhere except to the chosen model provider.
+- **Data leaving the machine:** each provider configuration asks once
+  (`confirm` with a key per provider id + endpoint), like Copilot today.
+  The panel shows which provider and model a conversation uses.
+
+#### 3.13.5 The agent loop
+
+State machine per conversation (UI-free, unit-tested with a scripted fake
+provider):
+
+```
+Idle ─user msg─► AwaitingModel ─text─► AwaitingModel (streaming)
+                      │ tool call(s)
+                      ▼
+               CheckingPolicy ─allowed─► RunningTool ─result─► AwaitingModel
+                      │ needs approval
+                      ▼
+               AwaitingApproval ─accept─► RunningTool
+                                └reject──► AwaitingModel (result: "rejected by user")
+AwaitingModel ─finish─► Idle      any state ─Stop─► Idle (cancel token)
+```
+
+- Limits: max tool steps per turn (default 25), per-call timeout, output
+  caps, and a running token estimate shown in the panel.
+- `edit_buffer` targets the revision the model read. If the user edited
+  meanwhile, the edit is **rebased** through `ChangeSet::map_pos` when the
+  anchors still match, otherwise the tool returns "document changed, read
+  it again".
+- Context: system prompt + agent definition + file metadata (name, size,
+  language, cursor/selection) + conversation. File text is **not** sent
+  up front; the model calls `read_buffer`/`read_file`. Old turns beyond the
+  provider's context are dropped oldest-first (summarization later).
+
+#### 3.13.6 Extension Builder
+
+A global agent (conversations are not tied to a file) with the system prompt
+in `assets/agents/extension-builder.md`. Its prompt **embeds
+`docs/plugins.md` at build time** (`include_str!`), so it always describes
+the plugin format this editor actually implements; a test checks that the
+prompt mentions every manifest field the parser accepts.
+
+Tools (only these):
+
+| Tool | What it does |
+|------|--------------|
+| `ext_list` | Installed extensions and agents with versions |
+| `ext_read` | Read a file inside one extension folder |
+| `ext_write` | Write a file inside a **staging** folder for the extension |
+| `ext_validate` | Parse the manifest(s) exactly as the editor would; return errors |
+| `ext_toolchain` | Which build options exist here (Rust + `wasm32-unknown-unknown`, Python, Node) |
+| `ext_build` | Build a WASM extension in staging (`cargo build --release --target wasm32-unknown-unknown`, time-limited, output captured). Risk: Process |
+| `ext_test` | Run one command of the **staged** extension on sample inputs through the real plugin host (sandbox and limits apply); return outputs/errors |
+| `ext_install` | Show the user a summary + diff of staged files; on approval, copy to the extensions folder (keeping the previous version in `.history/<version>/`) and reload plugins |
+| `ext_rollback` | Restore a previous version from `.history` |
+
+Workflow the prompt enforces: clarify the request -> choose the **least
+powerful** extension type that works -> write files in staging -> validate
+-> build if needed -> test with realistic inputs including edge cases ->
+explain what it does and what it can access -> `ext_install` (user approves)
+-> the user runs the command (normal plugin approval applies; the builder
+cannot approve it). Changes in later turns bump the version, so the user is
+asked again before the new version runs.
+
+Extension types the builder can create, from least to most powerful:
+
+1. **Declarative recipe** (new, sandboxed by construction, no toolchain):
+   `"kind": "recipe"` with a list of host-implemented steps, e.g.
+   `[{"regex_replace": {"pattern": "\\s+$", "replacement": ""}}, "sort_lines"]`.
+   Covers most text-cleanup requests.
+2. **WASM** plugin (sandboxed; needs Rust + `wasm32` target or another
+   language that targets wasm32).
+3. **Agent definition** (`agent.json`, see 3.13.7).
+4. **Process** plugin (full trust; Python/Node/...): only when the request
+   needs files, network or programs, and the builder must say so.
+
+#### 3.13.7 Agent definitions
+
+```json
+{
+  "api": 0,
+  "id": "commit-writer",
+  "name": "Commit Message Writer",
+  "version": "1.0.0",
+  "kind": "agent",
+  "scope": "file",
+  "system_prompt": "prompt.md",
+  "tools": ["read_buffer", "search", "git-tools.diff"],
+  "provider": null,
+  "commands": [{ "id": "open", "title": "Open Commit Message Writer" }]
+}
+```
+
+- `scope`: `"file"` (conversations per file, like the File agent) or
+  `"global"`.
+- `tools`: allowlist; unknown names are rejected at load. An agent can never
+  grant itself more than its definition lists, and the risk policy (3.13.4)
+  still applies.
+- `provider`: `null` uses the user's default provider.
+- Built-ins: `assets/agents/file-agent.json` + `file-agent.md`,
+  `assets/agents/extension-builder.json` + `extension-builder.md`.
+
+#### 3.13.8 Provider protocol (JSON lines over stdio)
+
+Request (one JSON object on stdin, then stdin closes):
+
+```json
+{"api": 0, "model": "gpt-4.1", "system": "...",
+ "messages": [{"role": "user", "content": "..."},
+              {"role": "assistant", "content": "...", "tool_calls": [{"id": "c1", "name": "read_buffer", "arguments": {}}]},
+              {"role": "tool", "tool_call_id": "c1", "content": "..."}],
+ "tools": [{"name": "read_buffer", "description": "...", "input_schema": {}}],
+ "max_output_tokens": 4096}
+```
+
+Events (one JSON object per line on stdout):
+
+```json
+{"type": "text", "delta": "Here is"}
+{"type": "tool_call", "id": "c2", "name": "edit_buffer", "arguments": {}}
+{"type": "usage", "input_tokens": 1200, "output_tokens": 80}
+{"type": "done", "reason": "tool_calls" | "stop" | "length"}
+{"type": "error", "message": "..."}
+```
+
+- One process per model turn (stateless; history is in the request).
+  Keep-alive is a later optimization.
+- Provider config lives in `<config>/providers/<id>/provider.json` (command
+  line, model, endpoint description) like a process plugin; API keys come
+  from the environment or the OS credential store, never from the editor's
+  files or conversations.
+- The existing "Ask Copilot" stays as a one-shot command: Copilot CLI runs
+  its own agent and cannot act as a tool-calling provider.
+
+#### 3.13.9 UI
+
+- **Agent panel** docked on the right (toggle `Ctrl+Alt+A`, View > Agent
+  Panel), resizable. Top: agent picker + conversation list for the current
+  file (or global for the Extension Builder) with New / Rename / Delete.
+  Middle: transcript with streaming text, collapsed tool-call cards (name,
+  arguments, result summary), and **approval cards** with a diff and
+  Accept / Reject. Bottom: input box (Enter sends, Shift+Enter newline),
+  Stop button, provider/model and token estimate.
+- New **Agent** menu: Agent Panel, New Conversation for This File,
+  Extension Builder, Providers..., Delete Agent Data.
+- Diff rendering: unified diff of the affected lines with the same row
+  renderer as the editor; "Edit" opens the proposal in a scratch tab.
+
+#### 3.13.10 Size and testing
+
+- Editor size impact: `re-agent` + tools + panel, estimated 150-300 KB
+  (`serde_json` is already linked). Providers are separate binaries.
+- Tests: scripted fake provider drives the loop (text, tool calls, parallel
+  calls, errors, cancel, step limit); permission policy table tests; scope
+  escape tests (`..`, absolute paths, symlinks, junctions); conversation
+  store round trips and crash safety; `edit_buffer` rebase vs "changed";
+  Extension Builder end to end with a scripted provider: create a recipe ->
+  validate -> test -> install (approval) -> run command (plugin approval) ->
+  modify in a second turn -> version bump -> asked again -> rollback.
+- Manual: a real provider (OpenAI-compatible endpoint or local Ollama) on a
+  real file; checked for egress prompts and that no write happens without
+  an accepted card.
+
 ---
 
 ## 4. Migration plan (tests green at every step)
@@ -372,6 +699,11 @@ strip = true
 | **7. Platform layer** | `interprocess`-based single instance; config dirs; `cargo-packager` installers | Ships on macOS/Linux |
 | **8. Plugins** | Plugin API v0 (WIT); WASM host (wasmi); external-process host; port AI provider to tier C with egress consent; LSP client | Rich, safe plugin ecosystem without growing the binary |
 | **9. Huge files** | Piece table over `pread` + LRU chunk cache as a `TextSource`; background `memchr` line index; read-only first, then editable | Instant open of multi-GB files |
+| **10. Agent core** | `re-agent`: conversation model + private on-disk store, `Tool` trait + registry + schema validation, permission policy, loop state machine; scripted fake provider; `data_dir` in `re-platform` | Agents testable without a UI or a model |
+| **11. Providers** | Provider protocol (3.13.8), streaming process host, `providers/openai` binary (OpenAI-compatible incl. local Ollama), provider config + per-provider egress consent | Any tool-calling model, no HTTP in the editor |
+| **12. File agent** | Agent panel (conversation list, streaming transcript, tool and approval cards with diffs), built-in tools, scope + rebasing edits, Agent menu | Per-file agents with many conversations |
+| **13. Extension Builder** | Declarative `recipe` kind; staging + `ext_*` tools; system prompt embedding `docs/plugins.md`; history/rollback; end-to-end scripted test | Users create and change extensions by conversation |
+| **14. Custom agents + contributed tools** | `agent.json` definitions (scope, prompt, tool allowlist, provider); `"tools"` in `plugin.json` (WASM sandboxed, process full trust); builder can create agents | Agents and tools are extensions |
 
 Phases 1–2 are low-risk and can start immediately. Phase 5 is the largest and
 depends on Phases 3 and 4. The GPUI spike (section 3.11) can run in
@@ -390,6 +722,21 @@ parallel once Phase 2 lands.
   read-only first (section 3.4). Risk: line-index memory for
   billion-line files; sample the index if needed. Re-check ropey 2.0 status
   before Phase 9.
+
+- **Agents (open):**
+  - *Prompt injection* from file contents or tool output: mitigated by
+    hard gates (writes always shown and approved, no network tool by
+    default, the model cannot approve anything), not by prompting.
+  - *Model quality* for tool use varies (especially small local models):
+    schema-validated arguments with structured errors; step limits.
+  - *Cost and privacy*: per-provider egress consent; local providers
+    supported; token estimate visible; conversations stored locally and
+    deletable.
+  - *Builder toolchain*: WASM needs Rust + `wasm32`; recipes cover common
+    requests without a toolchain; process plugins only when needed and
+    labelled full trust.
+  - *GPUI*: no rich-text/markdown widget; start with plain text + code
+    blocks in the transcript.
 
 ## 6. Progress
 - **Phase 1 (quick wins): done, except verifying CI on macOS/Linux.**
@@ -753,6 +1100,9 @@ parallel once Phase 2 lands.
   with checkmarks); no native macOS menu bar yet (`cx.set_menus`), so macOS
   also shows the in-window bar; disabled states are not shown (commands
   that do not apply explain why when run).
+- **AI agents designed (section 3.13; Phases 10-14), not implemented.**
+  System prompt drafts: `assets/agents/file-agent.md`,
+  `assets/agents/extension-builder.md`.
 - **All nine phases of the plan are done.** Remaining work from the
   proposal: editable huge files (piece table + append buffer), plugin panels/
   decorations/events and an LSP client, running CI on macOS/Linux for the

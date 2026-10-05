@@ -1,0 +1,12 @@
+{
+  "api": 0,
+  "id": "extension-builder",
+  "name": "Extension Builder",
+  "version": "0.1.0",
+  "kind": "agent",
+  "scope": "global",
+  "system_prompt": "extension-builder.md",
+  "tools": ["ext_list", "ext_read", "ext_write", "ext_validate", "ext_toolchain", "ext_build", "ext_test", "ext_install", "ext_rollback"],
+  "provider": null,
+  "commands": [{ "id": "open", "title": "Open Extension Builder" }]
+}

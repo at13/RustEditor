@@ -39,6 +39,7 @@ The repository is a Cargo workspace. The root package is the GPUI app
 | `src/ai.rs` | Copilot CLI provider; sends a temp snapshot of unsaved text |
 | `src/config.rs` | User keymap template (paths come from `re-platform`) |
 | `crates/re-plugin/` | `plugin.json` (`Manifest`, `Registry`), `protocol` (request/response JSON), `wasm` (wasmi sandbox: only `env.log`, fuel + memory caps), `process` (stdin/stdout, timeout, output cap), `approvals` |
+| `assets/agents/` | AI agent definitions and system prompts (design drafts for Phases 10-14, `docs/design-proposal.md` section 3.13; not wired up yet). Keep tool names in prompts, `*.json` and the design in sync |
 | `docs/plugins.md`, `plugins/examples/` | Plugin author guide and the example WASM plugin (built separately for `wasm32-unknown-unknown`) |
 | `crates/re-platform/` | `paths` (config/runtime dirs, `ensure_private_dir`, `file_url_to_path`), `instance` (lock + named pipe / Unix socket forwarding). The only crate with OS-specific code besides GPUI |
 | `packaging/`, `scripts/install.sh` | Linux desktop entry and per-user install; macOS bundle notes (`[package.metadata.bundle]` in `Cargo.toml`) |
