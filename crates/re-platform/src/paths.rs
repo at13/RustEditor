@@ -37,6 +37,31 @@ pub fn keymap_path() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join("keymap.toml"))
 }
 
+/// Where per-user application data lives (agent conversations, staging).
+/// Not synced settings: `%LOCALAPPDATA%\RustEditor` on Windows,
+/// `~/Library/Application Support/RustEditor` on macOS,
+/// `$XDG_DATA_HOME/rusteditor` or `~/.local/share/rusteditor` elsewhere.
+pub fn data_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        env_dir("LOCALAPPDATA").map(|dir| dir.join("RustEditor"))
+    } else if cfg!(target_os = "macos") {
+        env_dir("HOME").map(|home| home.join("Library/Application Support/RustEditor"))
+    } else {
+        env_dir("XDG_DATA_HOME")
+            .or_else(|| env_dir("HOME").map(|home| home.join(".local/share")))
+            .map(|dir| dir.join("rusteditor"))
+    }
+}
+
+/// Private folder for AI agent data (conversations may contain file text).
+pub fn agents_dir() -> io::Result<PathBuf> {
+    let dir = data_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no per-user data directory"))?
+        .join("agents");
+    ensure_private_dir(&dir)?;
+    Ok(dir)
+}
+
 /// Converts a `file://` URL (as delivered by macOS "open with") to a path.
 pub fn file_url_to_path(url: &str) -> Option<PathBuf> {
     let rest = url.strip_prefix("file://")?;
@@ -161,6 +186,8 @@ mod tests {
         let name = config.file_name().unwrap().to_string_lossy().to_lowercase();
         assert_eq!(name, "rusteditor");
         assert_eq!(keymap_path().unwrap(), config.join("keymap.toml"));
+        let data = data_dir().expect("data dir");
+        assert!(data.to_string_lossy().to_lowercase().contains("rusteditor"));
         let runtime = default_runtime_dir().expect("runtime dir");
         assert!(
             runtime

@@ -157,6 +157,22 @@ pub static MENUS: &[Menu] = &[
         ],
     },
     Menu {
+        title: "Agent",
+        mnemonic: 'a',
+        items: &[
+            cmd("agent.toggle_panel"),
+            named("agent.new_conversation", "New Conversation"),
+            cmd("agent.extension_builder"),
+            SEP,
+            named("agent.accept", "Accept Proposal"),
+            named("agent.reject", "Reject Proposal"),
+            cmd("agent.stop"),
+            SEP,
+            named("agent.providers", "Providers..."),
+            cmd("agent.delete_data"),
+        ],
+    },
+    Menu {
         title: "Plugins",
         mnemonic: 'p',
         items: &[

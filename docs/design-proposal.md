@@ -657,8 +657,8 @@ Events (one JSON object per line on stdout):
 
 #### 3.13.9 UI
 
-- **Agent panel** docked on the right (toggle `Ctrl+Alt+A`, View > Agent
-  Panel), resizable. Top: agent picker + conversation list for the current
+- **Agent panel** docked on the right (toggle `Mod+Shift+A`, Agent > Agent
+  Panel; `Ctrl+Alt+A` was dropped because it is AltGr+A on some layouts), resizable. Top: agent picker + conversation list for the current
   file (or global for the Extension Builder) with New / Rename / Delete.
   Middle: transcript with streaming text, collapsed tool-call cards (name,
   arguments, result summary), and **approval cards** with a diff and
@@ -1100,9 +1100,91 @@ parallel once Phase 2 lands.
   with checkmarks); no native macOS menu bar yet (`cx.set_menus`), so macOS
   also shows the in-window bar; disabled states are not shown (commands
   that do not apply explain why when run).
-- **AI agents designed (section 3.13; Phases 10-14), not implemented.**
-  System prompt drafts: `assets/agents/file-agent.md`,
-  `assets/agents/extension-builder.md`.
+- **Phases 10-14: AI agents (section 3.13).**
+  - *Core (`re-agent`).* `Session` is a pure state machine (Idle ->
+    Streaming -> Tools{Preparing, Approving, Running} -> ...) that returns
+    `Effect`s; every tool call gets exactly one result (rejections and
+    Stop included); 25 tool calls per user message. Conversations are
+    JSON in `<data>/agents/conversations/{files/<hash>,global}` (private
+    dirs, atomic writes, `subject.json` marker); untitled tabs are kept in
+    memory until saved as a file. `ToolRegistry::prepare` validates
+    arguments with a JSON-schema subset before `Tool::prepare`, which has no
+    side effects and returns `Run` or `Ask(Approval)` plus an `Action`
+    (worker closure or `EditBuffer`). `Remember::{Once, Conversation(key),
+    Persistent(key)}`: writes/process/install are always `Once`; reading
+    outside the scope is per folder per conversation; sandboxed contributed
+    tools reuse the plugin approval.
+  - *Tools (`re-agent-tools`).* `read_buffer` (numbered lines, 64 KB cap),
+    `edit_buffer` (exact unique `old_text`, LF text matches CRLF documents,
+    overlap check, diff), `read_file` (encoding-aware; streams huge files),
+    `list_dir`, `search` (re-search over files, skips `.git`/`target`/...,
+    binaries, >32 MB), `write_file`/`create_file`/`delete_file` (keep the
+    file's encoding, atomic write, refuse the open document), `run_command`
+    (argv, no shell, 120 s, output capped). Scope = repository root or the
+    file's folder; containment is checked on canonical paths (symlinks
+    count as outside).
+  - *Providers.* `rusteditor-openai` (separate 2.1 MB binary, ureq +
+    rustls): chat completions with streaming, tool-call delta assembly,
+    `--base-url`, `--api-key-env`, `--auth-header` (Azure `api-key`),
+    `--max-tokens-field`, HTTP errors with hints; tested against a local
+    TCP server. The editor runs providers per turn as processes; a
+    built-in OpenAI entry appears when the binary sits next to the editor
+    and `OPENAI_API_KEY` is set; others come from
+    `<config>/providers/*/provider.json`. Note: gpui 0.2.2 itself links
+    reqwest/rustls (`gpui_http_client`); our code adds no HTTP client to the
+    editor (CI checks that only the provider links ureq).
+  - *UI (`src/gpui_workspace/agent.rs`).* Right panel: agent picker,
+    History (saved conversations per file / global, open, delete),
+    transcript (user, assistant, tool results, notices; streaming text),
+    approval card (title, risk, detail, colored diff up to 300 lines,
+    Accept/Reject or Allow/Deny, Run, Install), per-provider consent card,
+    activity/provider/token line, "Next Provider", input (the existing
+    single-line command input, `CommandMode::Agent`). Agent menu (Alt+A on
+    Windows/Linux) with Panel, New Conversation, Extension Builder,
+    Accept/Reject, Stop, Providers..., Delete Agent Data (asks twice).
+    Accepted `edit_buffer` edits use `EditorState::replace_ranges` (one
+    undo step); if the document changed meanwhile they are re-found by old
+    text, else the model is told to re-read. Prepare/run happen on
+    `re_tasks::spawn` workers; results and provider events carry a
+    generation, so Stop drops late results.
+  - *Extension Builder.* `ext_list/read/write/validate/toolchain/build/
+    test/install/rollback` on a staging folder; `validate` loads the
+    extension with the real `Plugin::load` and checks agent tool names;
+    `test` runs commands through the real host (process plugins ask);
+    `install` asks with a summary + manifest diff, keeps the previous
+    version in `.history/<version>`, refuses changed content with the same
+    version, then reloads plugins; installed extensions still need their
+    plugin approval before running. The prompt appends `docs/plugins.md`.
+  - *Recipes, custom agents, contributed tools.* `"kind": "recipe"`
+    (declarative steps run in the editor), `"kind": "agent"` (scope,
+    prompt file, tool allowlist, provider; opens in the panel after the
+    plugin approval, which lists its tools), `"tools"` in `plugin.json`
+    (`<plugin-id>__<tool>`; WASM tools are `read`, process tools ask each
+    call).
+  - *Tests.* 16 tool tests (scope escapes, CRLF, rebase, encodings, ext
+    lifecycle incl. rollback), 4 provider tests (body, SSE assembly, local
+    HTTP server, errors), session/store/schema tests in `re-agent`, and six
+    GPUI tests with a scripted provider: read -> propose -> consent ->
+    accept -> one undo step; reject and stale-edit rebase; conversations
+    saved/listed/reopened/deleted; Stop; Extension Builder creates,
+    validates, tests, installs a recipe, runs it (plugin approval), updates
+    it (version bump, re-approval, history); custom agent approval + prompt
+    filling + tool allowlist.
+  - *Size.* Release `rusteditor.exe`: 11,729,408 bytes (Phase 9 + menus:
+    10,528,768; +1.08 MB). No new dependencies; `cargo bloat` shows the
+    growth spread over the app (+185 KB, the panel is the largest
+    function), `re-agent-tools` (162 KB), `re-agent` (117 KB), serde_json
+    (+75 KB) and std (+300 KB of instantiations). `#[inline(never)]` on cold
+    agent paths saved 33 KB. CI budget raised to 12 MB. A cargo feature to
+    build without agents would recover most of it; not done yet.
+  - *Known limits.* Not yet run against a real model service in this
+    environment (the provider is tested against a local fake server); the
+    input is single-line (no Shift+Enter); the transcript is plain text (no
+    Markdown, no virtualization beyond the last 200 messages); diffs are not
+    editable ("Edit in scratch tab" is not implemented); conversations of
+    untitled tabs are lost if the tab closes unsaved; renaming a file on
+    disk does not move its conversations; `ext_build` needs a local Rust
+    toolchain and has not been exercised in CI.
 - **All nine phases of the plan are done.** Remaining work from the
   proposal: editable huge files (piece table + append buffer), plugin panels/
   decorations/events and an LSP client, running CI on macOS/Linux for the

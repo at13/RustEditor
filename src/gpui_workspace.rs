@@ -37,6 +37,9 @@ use re_tasks::{
 
 use crate::ai::{AiRequest, ProviderKind, SourceDocument};
 
+mod agent;
+use agent::{AgentMessage, AgentState};
+
 const PREVIEW_CHARS: usize = 1_024;
 const ROW_HEIGHT: f32 = 26.0;
 const GUTTER_WIDTH: f32 = 60.0;
@@ -267,6 +270,15 @@ fn command_handler(id: &str) -> Option<CommandHandler> {
         "tools.calculator" => |w, win, cx| w.start_command(CommandMode::Calculator, win, cx),
         "tools.ask_ai" => |w, win, cx| w.ask_ai(win, cx),
         "plugins.reload" => |w, _, cx| w.reload_plugins(cx),
+        "agent.toggle_panel" => |w, win, cx| w.agent_toggle_panel(win, cx),
+        "agent.new_conversation" => |w, win, cx| w.agent_new_conversation(win, cx),
+        "agent.extension_builder" => |w, win, cx| w.agent_extension_builder(win, cx),
+        "agent.stop" => |w, _, cx| w.agent_stop(cx),
+        "agent.accept" => |w, _, cx| w.agent_answer(true, cx),
+        "agent.reject" => |w, _, cx| w.agent_answer(false, cx),
+        "agent.providers" => |w, _, cx| w.agent_providers(cx),
+        "agent.delete_data" => |w, _, cx| w.agent_delete_data(cx),
+        "app.menu.agent" => |w, _, cx| w.open_menu_named("Agent", cx),
         "plugins.forget_approvals" => |w, _, cx| w.forget_approvals(cx),
         "app.command_palette" => |w, win, cx| w.start_command(CommandMode::Palette, win, cx),
         "app.open_keymap" => |w, _, cx| w.open_keymap(cx),
@@ -474,6 +486,8 @@ enum CommandMode {
     Calculator,
     Replace,
     ReplaceAll,
+    /// Typing a message in the agent panel.
+    Agent,
 }
 
 #[derive(Clone, Copy)]
@@ -627,6 +641,7 @@ pub struct Workspace {
     regex: bool,
     replacement: String,
     list_scroll: UniformListScrollHandle,
+    agents: AgentState,
 }
 
 impl Workspace {
@@ -642,6 +657,7 @@ impl Workspace {
         let (reload_sender, reload_receiver) = waker.message_channel();
         let (plugin_sender, plugin_receiver) = waker.message_channel();
         let (index_sender, index_receiver) = waker.message_channel();
+        let (agent_sender, agent_receiver) = waker.message_channel::<AgentMessage>();
         let mut status = String::new();
         let server_sender = incoming_sender.clone();
         if let Some(server) = server
@@ -705,6 +721,7 @@ impl Workspace {
             regex: false,
             replacement: String::new(),
             list_scroll: UniformListScrollHandle::default(),
+            agents: AgentState::new(agent_sender, agent_receiver),
         };
         if paths.is_empty() {
             workspace.add_blank();
@@ -1034,6 +1051,7 @@ impl Workspace {
                 changed = true;
             }
         }
+        changed |= self.poll_agents(cx);
         if changed {
             cx.notify();
         }
@@ -1893,6 +1911,7 @@ impl Workspace {
                 .map_or_else(String::new, |query| query.text.clone()),
             CommandMode::Replace | CommandMode::ReplaceAll => self.replacement.clone(),
             CommandMode::Ask
+            | CommandMode::Agent
             | CommandMode::Calculator
             | CommandMode::Palette
             | CommandMode::GoToLine => String::new(),
@@ -1917,6 +1936,16 @@ impl Workspace {
     fn finish_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let command = self.command;
         let input = self.content.clone();
+        if matches!(command, Some(CommandMode::Agent)) {
+            // Keep typing in the panel; the message goes to the agent.
+            self.content.clear();
+            self.selected = 0..0;
+            self.marked = None;
+            self.layout = None;
+            self.agent_send(input, cx);
+            cx.notify();
+            return;
+        }
         if matches!(command, Some(CommandMode::Palette)) {
             let registry = command_registry(cx);
             let best = re_commands::palette::filter(&registry, &input)
@@ -1969,7 +1998,7 @@ impl Workspace {
                 self.replace_all(cx);
             }
             Some(CommandMode::GoToLine) => self.go_to_line(&input, cx),
-            Some(CommandMode::Calculator | CommandMode::Palette) | None => {}
+            Some(CommandMode::Calculator | CommandMode::Palette | CommandMode::Agent) | None => {}
         }
     }
 
@@ -2383,6 +2412,9 @@ impl Workspace {
         if self.pending_approval.as_deref() != Some(id) {
             self.pending_approval = None;
         }
+        if id != "agent.delete_data" {
+            self.agents.confirm_delete = false;
+        }
         match command_handler(id) {
             Some(handler) => handler(self, window, cx),
             None => {
@@ -2435,6 +2467,10 @@ impl Workspace {
     }
 
     fn run_plugin_command(&mut self, id: &str, cx: &mut Context<Self>) {
+        // The agent panel's input gives way; other command bars block.
+        if matches!(self.command, Some(CommandMode::Agent)) {
+            self.cancel_command(cx);
+        }
         if self.command.is_some() {
             return;
         }
@@ -2446,6 +2482,9 @@ impl Workspace {
             cx.notify();
             return;
         };
+        if matches!(plugin.manifest.kind, re_plugin::Kind::Agent(_)) {
+            return self.open_plugin_agent(&plugin, id, cx);
+        }
         let manifest = &plugin.manifest;
         let question = if manifest.kind.is_sandboxed() {
             format!(
@@ -3032,6 +3071,7 @@ impl Workspace {
             "search.toggle_case" => self.case_sensitive,
             "search.toggle_regex" => self.regex,
             "view.toggle_word_wrap" => self.word_wrap,
+            "agent.toggle_panel" => self.agents.open,
             "transform.toggle_scope" => self.selection_scope,
             "file.encoding_utf8" => doc.is_some_and(|d| d.encoding() == Encoding::Utf8),
             "file.encoding_utf8_bom" => doc.is_some_and(|d| d.encoding() == Encoding::Utf8Bom),
@@ -4319,6 +4359,7 @@ impl Render for Workspace {
                 editor.cursor_count(),
             )
         });
+        let agent_panel = self.agents.open.then(|| self.render_agent_panel(cx));
         let viewing_json = self.json_viewer.is_some();
         let json_lines = self.json_viewer.as_ref().map_or(0, ropey::Rope::len_lines);
         div()
@@ -4362,49 +4403,52 @@ impl Render for Workspace {
                         }),
                     )),
             )
-            .when(self.command.is_some(), |root| {
-                root.child(
-                    div()
-                        .flex()
-                        .h(px(ROW_HEIGHT + 12.))
-                        .items_center()
-                        .gap_2()
-                        .p_1()
-                        .bg(rgb(0xe8f2ff))
-                        .child(match self.command {
-                            Some(CommandMode::Palette) => "Command:",
-                            Some(CommandMode::Find) => "Find:",
-                            Some(CommandMode::GoToLine) => "Go to line:",
-                            Some(CommandMode::Ask) => "Ask Copilot:",
-                            Some(CommandMode::Calculator) => "Calculator:",
-                            Some(CommandMode::Replace) => "Replace match with:",
-                            Some(CommandMode::ReplaceAll) => "Replace all with:",
-                            None => "",
-                        })
-                        .child(self.input_widget(cx))
-                        .child(Self::toolbar_button(
-                            if matches!(self.command, Some(CommandMode::Calculator)) {
-                                "="
-                            } else if matches!(self.command, Some(CommandMode::Ask)) {
-                                "Ask"
-                            } else if matches!(
-                                self.command,
-                                Some(CommandMode::Replace | CommandMode::ReplaceAll)
-                            ) {
-                                "Replace"
-                            } else if matches!(self.command, Some(CommandMode::Palette)) {
-                                "Run"
-                            } else {
-                                "Search"
-                            },
-                            cx.listener(|this, _, window, cx| this.finish_command(window, cx)),
-                        ))
-                        .child(Self::toolbar_button(
-                            "Cancel",
-                            cx.listener(|this, _, _, cx| this.cancel_command(cx)),
-                        )),
-                )
-            })
+            .when(
+                self.command.is_some() && !matches!(self.command, Some(CommandMode::Agent)),
+                |root| {
+                    root.child(
+                        div()
+                            .flex()
+                            .h(px(ROW_HEIGHT + 12.))
+                            .items_center()
+                            .gap_2()
+                            .p_1()
+                            .bg(rgb(0xe8f2ff))
+                            .child(match self.command {
+                                Some(CommandMode::Palette) => "Command:",
+                                Some(CommandMode::Find) => "Find:",
+                                Some(CommandMode::GoToLine) => "Go to line:",
+                                Some(CommandMode::Ask) => "Ask Copilot:",
+                                Some(CommandMode::Calculator) => "Calculator:",
+                                Some(CommandMode::Replace) => "Replace match with:",
+                                Some(CommandMode::ReplaceAll) => "Replace all with:",
+                                Some(CommandMode::Agent) | None => "",
+                            })
+                            .child(self.input_widget(cx))
+                            .child(Self::toolbar_button(
+                                if matches!(self.command, Some(CommandMode::Calculator)) {
+                                    "="
+                                } else if matches!(self.command, Some(CommandMode::Ask)) {
+                                    "Ask"
+                                } else if matches!(
+                                    self.command,
+                                    Some(CommandMode::Replace | CommandMode::ReplaceAll)
+                                ) {
+                                    "Replace"
+                                } else if matches!(self.command, Some(CommandMode::Palette)) {
+                                    "Run"
+                                } else {
+                                    "Search"
+                                },
+                                cx.listener(|this, _, window, cx| this.finish_command(window, cx)),
+                            ))
+                            .child(Self::toolbar_button(
+                                "Cancel",
+                                cx.listener(|this, _, _, cx| this.cancel_command(cx)),
+                            )),
+                    )
+                },
+            )
             .when(matches!(self.command, Some(CommandMode::Palette)), |root| {
                 root.child(self.palette_results(cx))
             })
@@ -4456,79 +4500,95 @@ impl Render for Workspace {
             )
             .child(
                 div()
+                    .flex()
                     .flex_1()
                     .min_h_0()
-                    .when(viewing_json, |pane| {
-                        pane.child(Self::toolbar_button(
-                            "Close viewer",
-                            cx.listener(|this, _, _, cx| {
-                                this.json_viewer = None;
-                                cx.notify();
-                            }),
-                        ))
-                        .child(
-                            uniform_list(
-                                "json-lines",
-                                json_lines,
-                                cx.processor(|this, range: Range<usize>, _, _| {
-                                    range
-                                        .map(|index| {
-                                            let line = this
-                                                .json_viewer
-                                                .as_ref()
-                                                .expect("viewer is open")
-                                                .line(index);
-                                            let preview = line
-                                                .slice(..line.len_chars().min(PREVIEW_CHARS))
-                                                .to_string();
-                                            div()
-                                                .h(px(ROW_HEIGHT))
-                                                .whitespace_nowrap()
-                                                .child(preview)
-                                                .into_any_element()
-                                        })
-                                        .collect::<Vec<_>>()
-                                }),
-                            )
-                            .h_full(),
-                        )
-                    })
-                    .when(!viewing_json, |pane| {
-                        let editor = div()
-                            .id("editor-pane")
-                            .relative()
-                            .size_full()
-                            .key_context("Editor")
-                            .cursor(CursorStyle::IBeam)
-                            .on_mouse_down(MouseButton::Left, cx.listener(Self::doc_mouse_down))
-                            .on_mouse_move(cx.listener(Self::doc_mouse_move))
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
-                            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
-                            .on_scroll_wheel(cx.listener(Self::doc_scroll_wheel))
-                            .child(
-                                uniform_list(
-                                    "editor-lines",
-                                    list_rows.unwrap_or(count),
-                                    cx.processor(|this, range: Range<usize>, _window, cx| {
-                                        this.huge_rows = range.clone();
-                                        range
-                                            .map(|index| this.render_row(index, cx))
-                                            .collect::<Vec<_>>()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .min_h_0()
+                            .when(viewing_json, |pane| {
+                                pane.child(Self::toolbar_button(
+                                    "Close viewer",
+                                    cx.listener(|this, _, _, cx| {
+                                        this.json_viewer = None;
+                                        cx.notify();
                                     }),
+                                ))
+                                .child(
+                                    uniform_list(
+                                        "json-lines",
+                                        json_lines,
+                                        cx.processor(|this, range: Range<usize>, _, _| {
+                                            range
+                                                .map(|index| {
+                                                    let line = this
+                                                        .json_viewer
+                                                        .as_ref()
+                                                        .expect("viewer is open")
+                                                        .line(index);
+                                                    let preview = line
+                                                        .slice(
+                                                            ..line.len_chars().min(PREVIEW_CHARS),
+                                                        )
+                                                        .to_string();
+                                                    div()
+                                                        .h(px(ROW_HEIGHT))
+                                                        .whitespace_nowrap()
+                                                        .child(preview)
+                                                        .into_any_element()
+                                                })
+                                                .collect::<Vec<_>>()
+                                        }),
+                                    )
+                                    .h_full(),
                                 )
-                                .track_scroll(self.list_scroll.clone())
-                                .h_full(),
-                            )
-                            .child(ImeAnchor {
-                                workspace: cx.entity(),
-                            });
-                        // While the command bar is open it owns the focus.
-                        pane.child(if self.command.is_none() {
-                            editor.track_focus(&self.focus).into_any_element()
-                        } else {
-                            editor.into_any_element()
-                        })
-                    }),
+                            })
+                            .when(!viewing_json, |pane| {
+                                let editor = div()
+                                    .id("editor-pane")
+                                    .relative()
+                                    .size_full()
+                                    .key_context("Editor")
+                                    .cursor(CursorStyle::IBeam)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(Self::doc_mouse_down),
+                                    )
+                                    .on_mouse_move(cx.listener(Self::doc_mouse_move))
+                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
+                                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
+                                    .on_scroll_wheel(cx.listener(Self::doc_scroll_wheel))
+                                    .child(
+                                        uniform_list(
+                                            "editor-lines",
+                                            list_rows.unwrap_or(count),
+                                            cx.processor(
+                                                |this, range: Range<usize>, _window, cx| {
+                                                    this.huge_rows = range.clone();
+                                                    range
+                                                        .map(|index| this.render_row(index, cx))
+                                                        .collect::<Vec<_>>()
+                                                },
+                                            ),
+                                        )
+                                        .track_scroll(self.list_scroll.clone())
+                                        .h_full(),
+                                    )
+                                    .child(ImeAnchor {
+                                        workspace: cx.entity(),
+                                    });
+                                // While the command bar is open it owns the focus.
+                                pane.child(if self.command.is_none() {
+                                    editor.track_focus(&self.focus).into_any_element()
+                                } else {
+                                    editor.into_any_element()
+                                })
+                            }),
+                    )
+                    .children(agent_panel),
             )
             .child(
                 div()
@@ -6145,5 +6205,574 @@ mod tests {
                 assert!(editor.editor().unwrap().is_empty());
             })
             .unwrap();
+    }
+
+    // ----- Agents -----
+
+    use re_agent::{protocol::Event as AgentEvent, provider::ScriptedProvider};
+
+    fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> AgentEvent {
+        AgentEvent::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+        }
+    }
+
+    fn done() -> AgentEvent {
+        AgentEvent::Done {
+            reason: "stop".into(),
+        }
+    }
+
+    fn say(text: &str) -> Vec<AgentEvent> {
+        vec![AgentEvent::Text { delta: text.into() }, done()]
+    }
+
+    /// Isolated plugin, approval and conversation folders plus a scripted
+    /// provider. Returns the provider (to inspect requests) and the root.
+    fn agent_setup(
+        window: &gpui::WindowHandle<Workspace>,
+        cx: &mut gpui::TestAppContext,
+        name: &str,
+        turns: Vec<Vec<AgentEvent>>,
+    ) -> (Arc<ScriptedProvider>, PathBuf) {
+        let root = temp_path(name).with_extension("");
+        std::fs::create_dir_all(root.join("plugins")).unwrap();
+        let provider = Arc::new(ScriptedProvider::new(turns));
+        let shared = provider.clone();
+        let plugins = root.join("plugins");
+        let approvals = root.join("approvals.txt");
+        let data = root.join("data");
+        cx.update(|cx| {
+            load_plugins(cx, Some(plugins), Some(approvals));
+        });
+        window
+            .update(cx, |editor, _, cx| {
+                editor.agents.paths = agent::AgentPaths {
+                    plugins: Some(root.join("plugins")),
+                    conversations: Some(data.join("conversations")),
+                    staging: Some(data.join("staging")),
+                    providers: None,
+                };
+                editor.agents.providers = vec![agent::ProviderEntry {
+                    config: re_agent::provider::ProviderConfig {
+                        id: "scripted".into(),
+                        name: "Scripted".into(),
+                        command: vec!["none".into()],
+                        model: "test-model".into(),
+                        destination: "the test".into(),
+                        dir: PathBuf::new(),
+                    },
+                    provider: shared,
+                }];
+                editor.agents.providers_loaded = true;
+                editor.refresh_agents(cx);
+            })
+            .unwrap();
+        (provider, root)
+    }
+
+    /// Allows sending to the scripted provider (skips the consent card).
+    fn allow_provider(editor: &mut Workspace, cx: &mut Context<Workspace>) {
+        let egress = editor.agents.providers[0].config.egress_key();
+        cx.default_global::<PluginState>()
+            .approvals
+            .approve(&egress)
+            .unwrap();
+    }
+
+    fn agent_idle(editor: &Workspace) -> bool {
+        editor
+            .shown_live()
+            .is_some_and(|live| live.session.is_idle())
+    }
+
+    fn pending_title(editor: &Workspace) -> Option<String> {
+        editor
+            .shown_live()
+            .and_then(|live| live.session.pending_approval())
+            .map(|(_, approval)| approval.title.clone())
+    }
+
+    fn last_assistant_text(editor: &Workspace) -> String {
+        editor
+            .shown_live()
+            .and_then(|live| {
+                live.session
+                    .conversation
+                    .messages
+                    .iter()
+                    .rev()
+                    .find_map(|m| match m {
+                        re_agent::Message::Assistant { text, .. } if !text.is_empty() => {
+                            Some(text.clone())
+                        }
+                        _ => None,
+                    })
+            })
+            .unwrap_or_default()
+    }
+
+    #[gpui::test]
+    fn file_agent_reads_proposes_and_applies_an_undoable_edit(cx: &mut gpui::TestAppContext) {
+        let window = open_test_window(cx);
+        set_text(&window, cx, "fn main() {\n    println!(\"hi\");\n}\n");
+        let (provider, root) = agent_setup(
+            &window,
+            cx,
+            "agent-edit",
+            vec![
+                vec![
+                    tool_call("c1", "read_buffer", serde_json::json!({})),
+                    done(),
+                ],
+                vec![
+                    AgentEvent::Text {
+                        delta: "Changing the greeting.".into(),
+                    },
+                    tool_call(
+                        "c2",
+                        "edit_buffer",
+                        serde_json::json!({"edits": [{"old_text": "\"hi\"", "new_text": "\"hello\""}]}),
+                    ),
+                    done(),
+                ],
+                say("Done."),
+            ],
+        );
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_keystrokes(&primary("shift-a"));
+        window
+            .update(&mut cx, |editor, _, _| {
+                assert!(editor.agents.open);
+                assert!(matches!(editor.command, Some(CommandMode::Agent)));
+                assert_eq!(editor.shown_live().unwrap().def.id, agent::FILE_AGENT);
+            })
+            .unwrap();
+        cx.simulate_input("say hello");
+        cx.simulate_keystrokes("enter");
+        // First use of a provider asks for consent; nothing is sent yet.
+        window
+            .update(&mut cx, |editor, _, cx| {
+                assert!(editor.agents.consent.is_some());
+                assert!(provider.requests.lock().unwrap().is_empty());
+                assert_eq!(editor.content, "");
+                editor.agent_consent(true, cx);
+            })
+            .unwrap();
+        wait_until(&window, &mut cx, "edit approval", |e| {
+            pending_title(e).is_some()
+        });
+        window
+            .update(&mut cx, |editor, _, _| {
+                assert_eq!(pending_title(editor).unwrap(), "Edit Untitled");
+                // Nothing changes before the user accepts.
+                assert!(editor.document().unwrap().text().contains("\"hi\""));
+            })
+            .unwrap();
+        cx.simulate_keystrokes("escape");
+        window
+            .update(&mut cx, |editor, window, cx| {
+                editor.run_command("agent.accept", window, cx)
+            })
+            .unwrap();
+        wait_until(&window, &mut cx, "agent finished", agent_idle);
+        assert_eq!(
+            text(&window, &mut cx),
+            "fn main() {\n    println!(\"hello\");\n}\n"
+        );
+        window
+            .update(&mut cx, |editor, _, _| {
+                assert_eq!(last_assistant_text(editor), "Done.");
+            })
+            .unwrap();
+        let requests = provider.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].system.contains("Untitled"));
+        assert!(requests[0].tools.iter().any(|t| t.name == "edit_buffer"));
+        let read_result = serde_json::to_string(&requests[1].messages).unwrap();
+        assert!(read_result.contains("    2|     println!"), "{read_result}");
+        // One undo step reverts the agent's edit.
+        cx.simulate_keystrokes(&primary("z"));
+        assert_eq!(
+            text(&window, &mut cx),
+            "fn main() {\n    println!(\"hi\");\n}\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn rejected_edits_change_nothing_and_stale_edits_are_rebased(cx: &mut gpui::TestAppContext) {
+        let window = open_test_window(cx);
+        set_text(&window, cx, "alpha\nbeta\n");
+        let edit = |id: &str, old: &str, new: &str| {
+            vec![
+                tool_call(
+                    id,
+                    "edit_buffer",
+                    serde_json::json!({"edits": [{"old_text": old, "new_text": new}]}),
+                ),
+                done(),
+            ]
+        };
+        let (provider, root) = agent_setup(
+            &window,
+            cx,
+            "agent-reject",
+            vec![
+                edit("c1", "beta", "BETA"),
+                say("OK, left it."),
+                edit("c2", "beta", "gamma"),
+                say("Changed."),
+            ],
+        );
+        window
+            .update(cx, |editor, window, cx| {
+                editor.agent_toggle_panel(window, cx);
+                allow_provider(editor, cx);
+                editor.agent_send("uppercase beta".into(), cx);
+            })
+            .unwrap();
+        wait_until(&window, cx, "approval", |e| pending_title(e).is_some());
+        window
+            .update(cx, |editor, _, cx| editor.agent_answer(false, cx))
+            .unwrap();
+        wait_until(&window, cx, "idle after reject", agent_idle);
+        assert_eq!(text(&window, cx), "alpha\nbeta\n");
+        let second = serde_json::to_string(&provider.requests.lock().unwrap()[1].messages).unwrap();
+        assert!(second.contains("rejected"), "{second}");
+        // The user edits while the proposal waits: it is found again.
+        window
+            .update(cx, |editor, _, cx| {
+                editor.agent_send("rename beta".into(), cx)
+            })
+            .unwrap();
+        wait_until(&window, cx, "second approval", |e| {
+            pending_title(e).is_some()
+        });
+        window
+            .update(cx, |editor, _, cx| {
+                editor.with_editor(|doc, e| {
+                    e.set_cursor(doc, 0);
+                    e.insert(doc, "new first line\n")
+                });
+                editor.agent_answer(true, cx);
+            })
+            .unwrap();
+        wait_until(&window, cx, "idle after accept", agent_idle);
+        assert_eq!(text(&window, cx), "new first line\nalpha\ngamma\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn conversations_are_saved_listed_and_reopened(cx: &mut gpui::TestAppContext) {
+        let path = temp_path("agent-conv");
+        std::fs::write(&path, "data\n").unwrap();
+        let window = open_test_window(cx);
+        window
+            .update(cx, |editor, _, cx| {
+                editor.open_path(path.clone());
+                cx.notify();
+            })
+            .unwrap();
+        wait_until(&window, cx, "file loaded", |e| e.document().is_some());
+        let (_, root) = agent_setup(&window, cx, "agent-conv", vec![say("First answer.")]);
+        window
+            .update(cx, |editor, window, cx| {
+                editor.agent_toggle_panel(window, cx);
+                allow_provider(editor, cx);
+                editor.agent_send("What is this?".into(), cx);
+            })
+            .unwrap();
+        wait_until(&window, cx, "answer", |e| {
+            agent_idle(e) && last_assistant_text(e) == "First answer."
+        });
+        window
+            .update(cx, |editor, window, cx| {
+                let first = editor.shown_live().unwrap().session.conversation.id.clone();
+                assert_eq!(editor.agents.list.len(), 1);
+                assert_eq!(editor.agents.list[0].title, "What is this?");
+                // A new conversation for the same file, then back to the first.
+                editor.agent_new_conversation(window, cx);
+                assert!(
+                    editor
+                        .shown_live()
+                        .unwrap()
+                        .session
+                        .conversation
+                        .messages
+                        .is_empty()
+                );
+                editor.agents.lives.clear();
+                editor.open_saved(&first, cx);
+                let live = editor.shown_live().unwrap();
+                assert_eq!(live.session.conversation.id, first);
+                assert_eq!(live.session.conversation.messages.len(), 2);
+                assert_eq!(live.scope.as_deref(), path.parent());
+                editor.delete_saved(&first, cx);
+                assert!(editor.agents.list.is_empty());
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[gpui::test]
+    fn stop_cancels_a_running_turn(cx: &mut gpui::TestAppContext) {
+        let window = open_test_window(cx);
+        // A turn that never finishes.
+        let (_, root) = agent_setup(
+            &window,
+            cx,
+            "agent-stop",
+            vec![vec![AgentEvent::Text {
+                delta: "Thinking".into(),
+            }]],
+        );
+        window
+            .update(cx, |editor, window, cx| {
+                editor.agent_toggle_panel(window, cx);
+                allow_provider(editor, cx);
+                editor.agent_send("think".into(), cx);
+            })
+            .unwrap();
+        wait_until(&window, cx, "streaming", |e| {
+            e.shown_live()
+                .and_then(|l| l.session.streaming_text())
+                .is_some_and(|t| t == "Thinking")
+        });
+        window
+            .update(cx, |editor, window, cx| {
+                editor.run_command("agent.stop", window, cx);
+                assert!(agent_idle(editor));
+                let messages = &editor.shown_live().unwrap().session.conversation.messages;
+                assert!(matches!(
+                    messages.last(),
+                    Some(re_agent::Message::Notice { text }) if text == "Stopped."
+                ));
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn extension_builder_creates_installs_and_updates_a_recipe(cx: &mut gpui::TestAppContext) {
+        let window = open_test_window(cx);
+        set_text(&window, cx, "b  \na\n");
+        let manifest = |version: &str, steps: &str| {
+            format!(
+                r#"{{"api":0,"id":"tidy","name":"Tidy","version":"{version}","kind":"recipe","capabilities":["document"],
+                "commands":[{{"id":"run","title":"Tidy Lines","input":"document","steps":[{steps}]}}]}}"#
+            )
+        };
+        let write = |id: &str, content: String| {
+            tool_call(
+                id,
+                "ext_write",
+                serde_json::json!({"id": "tidy", "path": "plugin.json", "content": content}),
+            )
+        };
+        let (provider, root) = agent_setup(
+            &window,
+            cx,
+            "agent-builder",
+            vec![
+                vec![
+                    write(
+                        "w1",
+                        manifest("1.0.0", r#""trim_trailing_whitespace","sort_lines""#),
+                    ),
+                    tool_call("v1", "ext_validate", serde_json::json!({"id": "tidy"})),
+                    tool_call(
+                        "t1",
+                        "ext_test",
+                        serde_json::json!({"id": "tidy", "command": "run", "inputs": ["b  \na\n"]}),
+                    ),
+                    tool_call(
+                        "i1",
+                        "ext_install",
+                        serde_json::json!({"id": "tidy", "summary": "Sorts lines"}),
+                    ),
+                    done(),
+                ],
+                say("Installed Tidy."),
+                vec![
+                    write("w2", manifest("1.1.0", r#""sort_lines","reverse_lines""#)),
+                    tool_call("i2", "ext_install", serde_json::json!({"id": "tidy"})),
+                    done(),
+                ],
+                say("Updated."),
+            ],
+        );
+        window
+            .update(cx, |editor, window, cx| {
+                editor.run_command("agent.extension_builder", window, cx);
+                let live = editor.shown_live().unwrap();
+                assert_eq!(live.def.id, agent::BUILDER);
+                assert!(live.def.prompt.contains("Plugin format reference"));
+                allow_provider(editor, cx);
+                editor.agent_send("make a command that tidies lines".into(), cx);
+            })
+            .unwrap();
+        wait_until(&window, cx, "install approval", |e| {
+            pending_title(e).is_some()
+        });
+        window
+            .update(cx, |editor, _, cx| {
+                assert_eq!(
+                    pending_title(editor).unwrap(),
+                    "Install extension \"Tidy\" 1.0.0"
+                );
+                // Writing, validating and testing ran without asking.
+                let messages = serde_json::to_string(
+                    &editor.shown_live().unwrap().session.conversation.messages,
+                )
+                .unwrap();
+                assert!(messages.contains("OK: tidy"), "{messages}");
+                assert!(messages.contains(r#"a\\nb\\n"#), "{messages}");
+                editor.agent_answer(true, cx);
+            })
+            .unwrap();
+        wait_until(&window, cx, "installed", |e| {
+            agent_idle(e) && last_assistant_text(e) == "Installed Tidy."
+        });
+        assert!(root.join("plugins/tidy/plugin.json").is_file());
+        // The new command exists and needs its own approval to run.
+        window
+            .update(cx, |editor, window, cx| {
+                assert!(command_registry(cx).get("plugin.tidy.run").is_some());
+                editor.run_command("plugin.tidy.run", window, cx);
+                assert!(editor.status.contains("Run it again"), "{}", editor.status);
+                editor.run_command("plugin.tidy.run", window, cx);
+            })
+            .unwrap();
+        wait_until(&window, cx, "recipe applied", |e| {
+            e.document().unwrap().text() == "a\nb\n"
+        });
+        // Second turn: change it; the new version must be approved again.
+        window
+            .update(cx, |editor, _, cx| {
+                editor.agent_send("also reverse".into(), cx)
+            })
+            .unwrap();
+        wait_until(&window, cx, "update approval", |e| {
+            pending_title(e).is_some()
+        });
+        window
+            .update(cx, |editor, _, cx| {
+                assert_eq!(
+                    pending_title(editor).unwrap(),
+                    "Update extension \"Tidy\" 1.0.0 -> 1.1.0"
+                );
+                editor.agent_answer(true, cx);
+            })
+            .unwrap();
+        wait_until(&window, cx, "updated", |e| {
+            agent_idle(e) && last_assistant_text(e) == "Updated."
+        });
+        assert!(
+            root.join("plugins/tidy/.history/1.0.0/plugin.json")
+                .is_file()
+        );
+        window
+            .update(cx, |editor, window, cx| {
+                editor.run_command("plugin.tidy.run", window, cx);
+                assert!(editor.status.contains("Run it again"), "{}", editor.status);
+            })
+            .unwrap();
+        assert_eq!(provider.requests.lock().unwrap().len(), 4);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn custom_agents_from_plugins_need_approval(cx: &mut gpui::TestAppContext) {
+        let window = open_test_window(cx);
+        let (provider, root) = agent_setup(&window, cx, "agent-custom", vec![say("Reviewed.")]);
+        let dir = root.join("plugins/reviewer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plugin.json"),
+            r#"{"api":0,"id":"reviewer","name":"Reviewer","version":"1.0.0","kind":"agent",
+               "scope":"file","system_prompt":"prompt.md","tools":["read_buffer"],
+               "commands":[{"id":"open","title":"Open Reviewer"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("prompt.md"), "You review {{file_name}}.").unwrap();
+        window
+            .update(cx, |editor, window, cx| {
+                editor.host_effect(re_agent::tools::HostEffect::ReloadPlugins, cx);
+                editor.run_command("plugin.reviewer.open", window, cx);
+                assert!(editor.status.contains("read_buffer"), "{}", editor.status);
+                assert!(!editor.agents.open);
+                editor.run_command("plugin.reviewer.open", window, cx);
+                let live = editor.shown_live().unwrap();
+                assert_eq!(live.def.name, "Reviewer");
+                assert_eq!(live.session.tools().len(), 1);
+                allow_provider(editor, cx);
+                editor.agent_send("review".into(), cx);
+            })
+            .unwrap();
+        wait_until(&window, cx, "reviewed", |e| {
+            last_assistant_text(e) == "Reviewed."
+        });
+        let request = provider.requests.lock().unwrap()[0].clone();
+        assert_eq!(request.system, "You review Untitled.");
+        assert_eq!(request.tools.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn declining_consent_sends_nothing_and_plugins_run_while_typing_to_an_agent(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let window = open_test_window(cx);
+        set_text(
+            &window, cx, "b
+a
+",
+        );
+        let (provider, root) = agent_setup(&window, cx, "agent-consent", vec![say("x")]);
+        let dir = root.join("plugins/sorter");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plugin.json"),
+            r#"{"api":0,"id":"sorter","name":"Sorter","version":"1","kind":"recipe",
+               "capabilities":["document"],
+               "commands":[{"id":"sort","title":"Sort","input":"document","steps":["sort_lines"]}]}"#,
+        )
+        .unwrap();
+        window
+            .update(cx, |editor, window, cx| {
+                editor.host_effect(re_agent::tools::HostEffect::ReloadPlugins, cx);
+                editor.agent_toggle_panel(window, cx);
+                editor.agent_send("hello".into(), cx);
+                assert!(editor.agents.consent.is_some());
+                editor.agent_consent(false, cx);
+                assert!(editor.agents.consent.is_none());
+                assert_eq!(editor.status, "Not sent");
+                assert!(
+                    editor
+                        .shown_live()
+                        .unwrap()
+                        .session
+                        .conversation
+                        .messages
+                        .is_empty()
+                );
+                // A plugin command runs even while the agent input has focus.
+                assert!(matches!(editor.command, Some(CommandMode::Agent)));
+                editor.run_command("plugin.sorter.sort", window, cx);
+                editor.run_command("plugin.sorter.sort", window, cx);
+            })
+            .unwrap();
+        wait_until(&window, cx, "sorted", |e| {
+            e.document().unwrap().text()
+                == "a
+b
+"
+        });
+        assert!(provider.requests.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

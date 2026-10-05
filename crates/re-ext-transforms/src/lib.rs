@@ -5,7 +5,7 @@ use base64::{
 };
 use heck::{ToKebabCase, ToLowerCamelCase, ToSnakeCase, ToTitleCase, ToUpperCamelCase};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaseTransform {
     Lower,
     Upper,

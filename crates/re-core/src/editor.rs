@@ -437,6 +437,19 @@ impl EditorState {
         Some(EditOutcome { lines })
     }
 
+    /// Replaces several ranges at once (one undo step); the cursor ends
+    /// after the first replacement. Ranges are char offsets and must not
+    /// overlap. Used to apply edits proposed by agents.
+    pub fn replace_ranges(
+        &mut self,
+        doc: &mut Document,
+        edits: Vec<(Range<usize>, String)>,
+    ) -> Option<EditOutcome> {
+        let outcome = self.edit_ranges(doc, edits, false)?;
+        self.collapse_to_primary();
+        Some(outcome)
+    }
+
     /// Replaces `range` with `text` (single selection afterwards).
     pub fn replace_range(
         &mut self,

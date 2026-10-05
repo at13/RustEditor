@@ -1,0 +1,12 @@
+[package]
+name = "re-agent"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+re-tasks.workspace = true
+ropey.workspace = true
+serde.workspace = true
+serde_json.workspace = true

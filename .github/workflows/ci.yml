@@ -13,7 +13,12 @@ env:
   # plugin sandbox) to 11 MB. A build without WASM plugins
   # (`cargo build --release --no-default-features`) avoids that cost.
   # Phase 9 (huge files): 10,652,672 bytes.
-  SIZE_BUDGET_BYTES: 11000000
+  # Phases 10-14 (agents): 11,729,408 bytes (+1.08 MB: agent panel, tools,
+  # conversation store; no new dependencies, mostly serde/GPUI
+  # instantiations), so the budget is 12 MB. The OpenAI-compatible provider
+  # is a separate binary (rusteditor-openai, ~2.1 MB), reported but not
+  # counted.
+  SIZE_BUDGET_BYTES: 12000000
 
 jobs:
   check:
@@ -46,9 +51,19 @@ jobs:
       - name: Core crates must not depend on the UI
         shell: bash
         run: |
-          for crate in re-core re-commands re-search re-tasks re-view re-platform re-plugin re-ext-transforms re-ext-calculator; do
+          for crate in re-core re-commands re-search re-tasks re-view re-platform re-plugin re-ext-transforms re-ext-calculator re-agent re-agent-tools; do
             if cargo tree -e normal -p "$crate" | grep -Eq '\b(gpui|rfd)\b'; then
               echo "$crate depends on a UI crate"; exit 1
+            fi
+          done
+      - name: Agent code adds no HTTP client (providers are separate programs)
+        shell: bash
+        run: |
+          # gpui itself links reqwest/rustls (gpui_http_client); our crates
+          # must not add another HTTP stack: only rusteditor-openai uses ureq.
+          for crate in re-agent re-agent-tools rusteditor; do
+            if cargo tree -e normal -p "$crate" | grep -Eq 'ureq'; then
+              echo "$crate links ureq"; exit 1
             fi
           done
       - name: Example WASM plugin runs in the sandbox
@@ -73,12 +88,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
+      - run: cargo build --release -p rusteditor -p rusteditor-openai
       - name: Check binary size
         shell: pwsh
         run: |
           $size = (Get-Item target/release/rusteditor.exe).Length
           Write-Host "rusteditor.exe: $size bytes (budget $env:SIZE_BUDGET_BYTES)"
+          Write-Host "rusteditor-openai.exe: $((Get-Item target/release/rusteditor-openai.exe).Length) bytes (separate)"
           if ($size -gt [int64]$env:SIZE_BUDGET_BYTES) {
             Write-Error "Release binary exceeds size budget"
             exit 1

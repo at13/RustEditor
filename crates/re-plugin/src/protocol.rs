@@ -118,6 +118,7 @@ mod tests {
             title: "C".into(),
             input: Input::Selection,
             output,
+            steps: Vec::new(),
         }
     }
 

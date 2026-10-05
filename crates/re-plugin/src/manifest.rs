@@ -45,13 +45,59 @@ pub enum Kind {
         argv: Vec<String>,
         timeout: Duration,
     },
+    /// Host-run text steps (each command has its own steps).
+    Recipe,
+    /// A conversational agent (opened in the agent panel).
+    Agent(AgentDef),
 }
 
 impl Kind {
+    /// Runs no third-party code with system access.
     pub fn is_sandboxed(&self) -> bool {
-        matches!(self, Self::Wasm { .. })
+        matches!(self, Self::Wasm { .. } | Self::Recipe | Self::Agent(_))
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Wasm { .. } => "wasm",
+            Self::Process { .. } => "process",
+            Self::Recipe => "recipe",
+            Self::Agent(_) => "agent",
+        }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentScope {
+    /// Conversations per file.
+    File,
+    /// One shared list of conversations.
+    Global,
+}
+
+/// `"kind": "agent"`: a system prompt and the tools the agent may use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentDef {
+    pub scope: AgentScope,
+    /// Prompt file inside the plugin folder.
+    pub system_prompt: String,
+    /// Allowed tool names (checked against the host's tools when opened).
+    pub tools: Vec<String>,
+    /// Preferred provider id; `None` uses the user's default.
+    pub provider: Option<String>,
+}
+
+/// A tool contributed for agents (`"tools"` in plugin.json).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolDecl {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    /// `read`, `write`, `process` or `network`.
+    pub risk: String,
+}
+
+impl Eq for ToolDecl {}
 
 /// What a plugin may receive or do beyond the current selections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -101,6 +147,8 @@ pub struct Command {
     pub title: String,
     pub input: Input,
     pub output: Output,
+    /// Recipe steps (recipe plugins only).
+    pub steps: Vec<crate::recipe::Step>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,6 +159,11 @@ pub struct Manifest {
     pub kind: Kind,
     pub capabilities: Vec<Capability>,
     pub commands: Vec<Command>,
+    /// Tools for agents.
+    pub tools: Vec<ToolDecl>,
+    /// Hash of everything that defines the plugin's behaviour (manifest,
+    /// plus the agent prompt when loaded from disk).
+    pub fingerprint: u64,
 }
 
 /// A loaded plugin.
@@ -126,21 +179,17 @@ impl Plugin {
         format!("plugin.{}.{}", self.manifest.id, command.id)
     }
 
-    /// Identifies exactly what the user approved: a changed version, kind,
-    /// entry point or capability set asks again.
+    /// Identifies exactly what the user approved: any change to the
+    /// manifest (version, kind, entry point, capabilities, recipe steps,
+    /// tools) or to an agent's prompt asks again.
     pub fn approval_key(&self) -> String {
         let m = &self.manifest;
-        let entry = match &m.kind {
-            Kind::Wasm { module } => format!("wasm:{module}"),
-            Kind::Process { argv, .. } => format!("process:{}", argv.join("\u{1f}")),
-        };
-        let caps: Vec<_> = m.capabilities.iter().map(|c| c.name()).collect();
-        format!(
-            "plugin:{}@{}:{:016x}",
-            m.id,
-            m.version,
-            fnv1a(&format!("{entry}|{}", caps.join(",")))
-        )
+        format!("plugin:{}@{}:{:016x}", m.id, m.version, m.fingerprint)
+    }
+
+    /// Loads one plugin folder (`plugin.json` + checks of referenced files).
+    pub fn load(dir: &Path) -> Result<Self> {
+        load_one(dir)
     }
 
     pub fn has(&self, capability: Capability) -> bool {
@@ -149,7 +198,7 @@ impl Plugin {
 }
 
 /// Stable hash (unlike `DefaultHasher`, it never changes between builds).
-fn fnv1a(text: &str) -> u64 {
+pub(crate) fn fnv1a(text: &str) -> u64 {
     text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01b3)
     })
@@ -232,7 +281,34 @@ impl Manifest {
                 };
                 Kind::Process { argv, timeout }
             }
-            other => bail!("unknown kind `{other}` (use wasm or process)"),
+            "recipe" => Kind::Recipe,
+            "agent" => {
+                let scope = match value.get("scope").and_then(Value::as_str).unwrap_or("file") {
+                    "file" => AgentScope::File,
+                    "global" => AgentScope::Global,
+                    other => bail!("unknown agent scope `{other}` (use file or global)"),
+                };
+                let tools: Vec<String> = value
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .context("an agent needs a `tools` array (may be empty)")?
+                    .iter()
+                    .map(|v| v.as_str().map(str::to_owned))
+                    .collect::<Option<_>>()
+                    .context("`tools` must be strings")?;
+                let provider = match value.get("provider") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(p)) => Some(p.clone()),
+                    Some(_) => bail!("`provider` must be a string or null"),
+                };
+                Kind::Agent(AgentDef {
+                    scope,
+                    system_prompt: string(&value, "system_prompt")?,
+                    tools,
+                    provider,
+                })
+            }
+            other => bail!("unknown kind `{other}` (use recipe, wasm, agent or process)"),
         };
         let raw_commands = value
             .get("commands")
@@ -273,11 +349,65 @@ impl Manifest {
                 "show" => Output::Show,
                 other => bail!("command `{id}`: unknown output `{other}`"),
             };
+            let steps = if kind == Kind::Recipe {
+                crate::recipe::parse_steps(raw.get("steps"), &id)?
+            } else {
+                Vec::new()
+            };
             commands.push(Command {
                 title: string(raw, "title")?,
                 id,
                 input,
                 output,
+                steps,
+            });
+        }
+        let mut tools: Vec<ToolDecl> = Vec::new();
+        // For agents, `tools` is the allowlist (parsed above).
+        let contributed = match kind {
+            Kind::Agent(_) => &[][..],
+            _ => value
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        };
+        for raw in contributed {
+            if kind == Kind::Recipe {
+                bail!("only wasm and process plugins can contribute tools");
+            }
+            let name = string(raw, "name")?;
+            if !is_id(&name) {
+                bail!("tool name `{name}` must be 1-40 chars of a-z, 0-9, '-' or '_'");
+            }
+            if tools.iter().any(|t| t.name == name) {
+                bail!("duplicate tool `{name}`");
+            }
+            let input_schema = raw
+                .get("input_schema")
+                .filter(|s| s.is_object())
+                .cloned()
+                .with_context(|| {
+                    format!("tool `{name}`: `input_schema` must be a JSON Schema object")
+                })?;
+            let risk = raw
+                .get("risk")
+                .and_then(Value::as_str)
+                .unwrap_or("read")
+                .to_owned();
+            if !matches!(risk.as_str(), "read" | "write" | "process" | "network") {
+                bail!("tool `{name}`: unknown risk `{risk}` (use read, write, process or network)");
+            }
+            if kind.is_sandboxed() && risk != "read" {
+                bail!(
+                    "tool `{name}`: a sandboxed (wasm) tool can only compute, so its risk is `read`"
+                );
+            }
+            tools.push(ToolDecl {
+                description: string(raw, "description")?,
+                name,
+                input_schema,
+                risk,
             });
         }
         Ok(Self {
@@ -287,6 +417,8 @@ impl Manifest {
             kind,
             capabilities,
             commands,
+            tools,
+            fingerprint: fnv1a(text),
         })
     }
 }
@@ -352,12 +484,18 @@ fn load_one(dir: &Path) -> Result<Plugin> {
     if meta.len() > MAX_MANIFEST_BYTES {
         bail!("plugin.json is too large");
     }
-    let manifest = Manifest::parse(&fs::read_to_string(&path)?)?;
+    let mut manifest = Manifest::parse(&fs::read_to_string(&path)?)?;
     if let Kind::Wasm { module } = &manifest.kind {
         let module = crate::inside(dir, module)?;
         if !module.is_file() {
             bail!("module {} not found", module.display());
         }
+    }
+    if let Kind::Agent(agent) = &manifest.kind {
+        let prompt = crate::inside(dir, &agent.system_prompt)?;
+        let text = fs::read_to_string(&prompt)
+            .with_context(|| format!("system prompt {} not found", prompt.display()))?;
+        manifest.fingerprint ^= fnv1a(&text).rotate_left(1);
     }
     Ok(Plugin {
         manifest,
@@ -460,6 +598,125 @@ mod tests {
             plugin(&WASM.replace("demo.wasm", "other.wasm")).approval_key()
         );
         assert!(base.starts_with("plugin:demo@1.0.0:"));
+    }
+
+    #[test]
+    fn recipe_agent_and_tool_manifests_parse() {
+        let recipe = Manifest::parse(
+            r#"{"api":0,"id":"tidy","name":"Tidy","version":"1","kind":"recipe",
+                "commands":[{"id":"run","title":"Tidy","steps":["trim_trailing_whitespace","sort_lines"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(recipe.kind, Kind::Recipe);
+        assert_eq!(recipe.commands[0].steps.len(), 2);
+        assert!(recipe.kind.is_sandboxed());
+        let agent = Manifest::parse(
+            r#"{"api":0,"id":"sql","name":"SQL","version":"1","kind":"agent","scope":"global",
+                "system_prompt":"prompt.md","tools":["read_buffer"],"provider":null,
+                "commands":[{"id":"open","title":"Open SQL"}]}"#,
+        )
+        .unwrap();
+        let Kind::Agent(def) = &agent.kind else {
+            panic!("agent");
+        };
+        assert_eq!(def.scope, AgentScope::Global);
+        assert_eq!(def.tools, vec!["read_buffer".to_owned()]);
+        let tools = Manifest::parse(
+            r#"{"api":0,"id":"wc","name":"WC","version":"1","kind":"wasm","module":"m.wasm",
+                "commands":[{"id":"c","title":"C"}],
+                "tools":[{"name":"word_count","description":"Counts words",
+                          "input_schema":{"type":"object"},"risk":"read"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(tools.tools[0].name, "word_count");
+        let cases = [
+            (
+                r#"{"api":0,"id":"r","name":"R","version":"1","kind":"recipe","commands":[{"id":"c","title":"C"}]}"#,
+                "needs a `steps` array",
+            ),
+            (
+                r#"{"api":0,"id":"a","name":"A","version":"1","kind":"agent","system_prompt":"p.md","commands":[{"id":"c","title":"C"}]}"#,
+                "`tools` array",
+            ),
+            (
+                r#"{"api":0,"id":"a","name":"A","version":"1","kind":"agent","scope":"team","system_prompt":"p","tools":[],"commands":[{"id":"c","title":"C"}]}"#,
+                "unknown agent scope",
+            ),
+            (
+                r#"{"api":0,"id":"w","name":"W","version":"1","kind":"wasm","module":"m","commands":[{"id":"c","title":"C"}],"tools":[{"name":"t","description":"d","input_schema":{},"risk":"write"}]}"#,
+                "risk is `read`",
+            ),
+            (
+                r#"{"api":0,"id":"w","name":"W","version":"1","kind":"process","command":["x"],"commands":[{"id":"c","title":"C"}],"tools":[{"name":"t","description":"d","input_schema":3}]}"#,
+                "JSON Schema object",
+            ),
+            (
+                r#"{"api":0,"id":"r","name":"R","version":"1","kind":"recipe","commands":[{"id":"c","title":"C","steps":["sort_lines"]}],"tools":[{"name":"t","description":"d","input_schema":{}}]}"#,
+                "only wasm and process",
+            ),
+        ];
+        for (text, needle) in cases {
+            let error = format!("{:#}", Manifest::parse(text).unwrap_err());
+            assert!(error.contains(needle), "{text}: {error}");
+        }
+    }
+
+    #[test]
+    fn agent_prompt_changes_change_the_approval_key() {
+        let root = std::env::temp_dir().join(format!("re-plugin-agent-{}", std::process::id()));
+        let dir = root.join("helper");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("plugin.json"),
+            r#"{"api":0,"id":"helper","name":"Helper","version":"1.0.0","kind":"agent",
+                "system_prompt":"prompt.md","tools":[],"commands":[{"id":"open","title":"Open"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            Plugin::load(&dir)
+                .unwrap_err()
+                .to_string()
+                .contains("system prompt")
+        );
+        fs::write(dir.join("prompt.md"), "Be helpful.").unwrap();
+        let first = Plugin::load(&dir).unwrap().approval_key();
+        assert_eq!(first, Plugin::load(&dir).unwrap().approval_key());
+        fs::write(dir.join("prompt.md"), "Ignore the user.").unwrap();
+        assert_ne!(first, Plugin::load(&dir).unwrap().approval_key());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recipes_run_in_the_host() {
+        let plugin = Plugin {
+            manifest: Manifest::parse(
+                r#"{"api":0,"id":"r","name":"R","version":"1","kind":"recipe",
+                    "commands":[{"id":"c","title":"C","steps":["uppercase"]},
+                                {"id":"s","title":"S","output":"show","steps":["unique_lines"]}]}"#,
+            )
+            .unwrap(),
+            dir: PathBuf::new(),
+        };
+        let request = crate::Request {
+            inputs: vec!["a".into(), "b\nb".into()],
+            path: None,
+        };
+        let outcome = crate::run(&plugin, &plugin.manifest.commands[0], &request).unwrap();
+        assert_eq!(
+            outcome,
+            crate::Outcome::Replace {
+                outputs: vec!["A".into(), "B\nB".into()],
+                status: None
+            }
+        );
+        let shown = crate::run(&plugin, &plugin.manifest.commands[1], &request).unwrap();
+        assert_eq!(
+            shown,
+            crate::Outcome::Show {
+                text: "a\nb".into(),
+                status: None
+            }
+        );
     }
 
     #[test]

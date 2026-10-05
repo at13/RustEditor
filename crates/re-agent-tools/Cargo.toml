@@ -1,0 +1,18 @@
+[package]
+name = "re-agent-tools"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+re-agent.workspace = true
+re-core.workspace = true
+re-plugin.workspace = true
+re-search.workspace = true
+re-tasks.workspace = true
+ropey.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+re-plugin = { path = "../re-plugin", features = ["wasm"] }

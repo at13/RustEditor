@@ -25,6 +25,7 @@
 "mod-shift-p" = "app.command_palette"
 "f1" = "app.command_palette"
 "alt-z" = "view.toggle_word_wrap"
+"mod-shift-a" = "agent.toggle_panel"
 
 [editor]
 "enter" = "editor.newline"
@@ -94,6 +95,7 @@
 "alt-t" = "app.menu.transform"
 "alt-b" = "app.menu.bookmarks"
 "alt-o" = "app.menu.tools"
+"alt-a" = "app.menu.agent"
 "alt-p" = "app.menu.plugins"
 
 [global.linux]
@@ -104,4 +106,5 @@
 "alt-t" = "app.menu.transform"
 "alt-b" = "app.menu.bookmarks"
 "alt-o" = "app.menu.tools"
+"alt-a" = "app.menu.agent"
 "alt-p" = "app.menu.plugins"

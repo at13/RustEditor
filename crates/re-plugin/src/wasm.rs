@@ -244,6 +244,34 @@ mod tests {
     }
 
     #[test]
+    fn contributed_tools_are_called_with_their_own_request() {
+        let dir = std::env::temp_dir().join(format!("re-plugin-tool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("m.wasm"), fixed(r#"{"result":{"words":3}}"#)).unwrap();
+        let plugin = crate::Plugin {
+            manifest: crate::Manifest::parse(
+                r#"{"api":0,"id":"wc","name":"WC","version":"1","kind":"wasm","module":"m.wasm",
+                    "commands":[{"id":"c","title":"C"}],
+                    "tools":[{"name":"word_count","description":"d","input_schema":{"type":"object"}}]}"#,
+            )
+            .unwrap(),
+            dir: dir.clone(),
+        };
+        let result =
+            crate::call_tool(&plugin, "word_count", &serde_json::json!({"text": "a b c"})).unwrap();
+        assert_eq!(result, serde_json::json!({"words": 3}));
+        assert!(crate::call_tool(&plugin, "other", &serde_json::json!({})).is_err());
+        std::fs::write(dir.join("m.wasm"), fixed(r#"{"error":"no"}"#)).unwrap();
+        assert_eq!(
+            crate::call_tool(&plugin, "word_count", &serde_json::json!({}))
+                .unwrap_err()
+                .to_string(),
+            "no"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn bad_modules_and_out_of_bounds_responses_are_errors() {
         assert!(run_bytes(b"not wasm", b"{}").is_err());
         let missing = wat::parse_str(r#"(module (memory (export "memory") 1))"#).unwrap();

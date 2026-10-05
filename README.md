@@ -12,7 +12,7 @@ cargo run --release
 ```
 
 The window has a standard **menu bar** (File, Edit, Search, View,
-Transform, Bookmarks, Tools, Plugins). Click a menu to open it, move across
+Transform, Bookmarks, Tools, Agent, Plugins). Click a menu to open it, move across
 the bar to switch menus, and click an item or press Enter; items show their
 keyboard shortcut and a checkmark for on/off settings (Match Case, Word
 Wrap, encoding, line endings). On Windows and Linux, Alt plus the underlined
@@ -75,6 +75,36 @@ with your full access and say so. Every plugin asks before its first run;
 **Forget Plugin and Copilot Approvals** revokes. Results are ordinary
 undoable edits, applied only if the document did not change meanwhile.
 
+**Agents** (`Ctrl+Shift+A`, Agent > Agent Panel; `Cmd+Shift+A` on macOS)
+open a panel on the right. The **File Agent** answers questions about the
+active file and proposes changes with its tools (read the buffer, edit it,
+read/list/search nearby files, write or create other files). Every change is
+shown as a diff that you **Accept** or **Reject**; an accepted edit is one
+undo step, and nothing is written before you accept. Reading outside the
+file's folder (its git repository, or its folder) asks once per folder.
+Each file can have many conversations (**New**, **History**); they are
+saved per file in the per-user data folder (`%LOCALAPPDATA%\RustEditor\agents`
+on Windows) and **Delete Agent Data** removes them all. **Stop** ends a
+running turn.
+The **Extension Builder** (Agent > Extension Builder) creates and changes
+extensions by conversation: it writes them in a staging folder, validates
+and test-runs them in the real plugin sandbox, and installs only after you
+accept a summary; each update keeps the previous version for rollback, and
+the new command still asks before its first run. Extensions can be
+recipes (lists of built-in text steps), WebAssembly, programs, or **custom
+agents** (a prompt plus a tool allowlist), and plugins can contribute
+**tools** that agents may call; see [docs/plugins.md](docs/plugins.md).
+Models are reached through **provider programs**, never by the editor
+itself: `rusteditor-openai` (built from `providers/openai`) talks to any
+OpenAI-compatible API, including local Ollama and Azure OpenAI; it is used
+automatically when it sits next to `rusteditor.exe` and `OPENAI_API_KEY` is
+set, and **Agent > Providers...** shows how to configure others. The first
+message to each provider asks before sending the conversation (and any file
+text the agent reads) off the machine. API keys stay in environment
+variables. Limits: providers are not yet tested against every service;
+custom agents cannot add UI; the transcript renders plain text (no
+Markdown).
+
 **Command Palette** (`Ctrl+Shift+P` or `F1`; `Cmd+Shift+P` on macOS) lists
 every command with its shortcut. Type part of a name (for example
 `fmt json` or `bookmark clear`) and press Enter to run the top match, or
@@ -119,10 +149,12 @@ not see each other and could both open the same file.
 src/                  GPUI application (root package `rusteditor`)
   main.rs             Startup: absolute paths, single instance, launches GPUI
   gpui_workspace.rs   GPUI tabs, virtual rows, input, tools, and workers
+  gpui_workspace/agent.rs  Agent panel: sessions, tool workers, approvals
   ai.rs               Copilot provider and temporary snapshot handling
   config.rs           User keymap template
 assets/
   default-keymap.toml Default key bindings (embedded in the binary)
+  agents/             Built-in agents (File Agent, Extension Builder)
 crates/               UI-independent crates (never depend on GPUI)
   re-core/            Rope storage, revision, save/reload (document.rs);
                       encodings, streaming decode/encode and crash-safe
@@ -132,7 +164,11 @@ crates/               UI-independent crates (never depend on GPUI)
   re-tasks/           Worker threads, cancellation tokens, UI wake-ups
   re-platform/        Per-user dirs, single instance (named pipe / Unix socket)
   re-plugin/          Plugin manifests, WASM sandbox (wasmi), process host,
-                      approvals
+                      recipes, agent/tool declarations, approvals
+  re-agent/           Agent loop (state machine), conversations + store,
+                      tool registry, risks, provider protocol and host
+  re-agent-tools/     Built-in agent tools and the Extension Builder's tools
+providers/openai/     rusteditor-openai: OpenAI-compatible provider program
 plugins/examples/     Example plugin (Rust -> wasm32)
 packaging/            Linux .desktop entry, macOS bundle notes
   re-commands/        Command registry, platform-neutral keymaps, palette matching

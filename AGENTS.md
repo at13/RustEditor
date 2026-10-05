@@ -38,8 +38,12 @@ The repository is a Cargo workspace. The root package is the GPUI app
 | `crates/re-ext-calculator/src/lib.rs` | Arithmetic expression parser for the calculator overlay |
 | `src/ai.rs` | Copilot CLI provider; sends a temp snapshot of unsaved text |
 | `src/config.rs` | User keymap template (paths come from `re-platform`) |
-| `crates/re-plugin/` | `plugin.json` (`Manifest`, `Registry`), `protocol` (request/response JSON), `wasm` (wasmi sandbox: only `env.log`, fuel + memory caps), `process` (stdin/stdout, timeout, output cap), `approvals` |
-| `assets/agents/` | AI agent definitions and system prompts (design drafts for Phases 10-14, `docs/design-proposal.md` section 3.13; not wired up yet). Keep tool names in prompts, `*.json` and the design in sync |
+| `crates/re-plugin/` | `plugin.json` (`Manifest`, `Registry`; kinds `wasm`, `process`, `recipe`, `agent`; contributed `tools`), `protocol` (request/response JSON), `recipe` (declarative steps, run host-side), `wasm` (wasmi sandbox: only `env.log`, fuel + memory caps), `process` (stdin/stdout, timeout, output cap), `call_tool`, `approvals` |
+| `assets/agents/` | Built-in agents (`file-agent`, `extension-builder`): `*.json` (scope, tool allowlist) + system prompts, embedded with `include_str!`. The builder's prompt gets `docs/plugins.md` appended, so keep that doc accurate. Keep tool names in prompts, `*.json`, `re-agent-tools` and the design in sync |
+| `crates/re-agent/` | Agent core, UI-free: `session` (loop state machine returning `Effect`s), `conversation` + `store` (private per-user JSON, atomic), `tools` (`Tool`, `ToolRegistry`, `Risk`, `Approval`/`Remember`, `Action`), `schema` (argument validation), `protocol` + `provider` (JSON-lines provider programs, `ScriptedProvider` for tests), `diff`, `prompt` |
+| `crates/re-agent-tools/` | Built-in tools (`buffer`, `files`, `search`, `process`), scope checks (`scope`), Extension Builder tools (`ext`: staging, validate, test, install with `.history` rollback), plugin-contributed tools (`plugin`, named `<id>__<tool>`) |
+| `src/gpui_workspace/agent.rs` | Agent panel: `AgentState`, live sessions, provider runs, tool prepare/run on workers, approval/consent cards, applying `edit_buffer` edits |
+| `providers/openai/` | `rusteditor-openai`: OpenAI-compatible provider program (ureq + rustls); the editor itself never links an HTTP client of its own |
 | `docs/plugins.md`, `plugins/examples/` | Plugin author guide and the example WASM plugin (built separately for `wasm32-unknown-unknown`) |
 | `crates/re-platform/` | `paths` (config/runtime dirs, `ensure_private_dir`, `file_url_to_path`), `instance` (lock + named pipe / Unix socket forwarding). The only crate with OS-specific code besides GPUI |
 | `packaging/`, `scripts/install.sh` | Linux desktop entry and per-user install; macOS bundle notes (`[package.metadata.bundle]` in `Cargo.toml`) |
@@ -141,6 +145,20 @@ Preserve these when changing code:
    changes (`Plugin::approval_key`, `COPILOT_EGRESS_KEY`). Never describe a
    process plugin as sandboxed. WASM plugins may import only `env.log`;
    keep fuel/memory/output limits.
+
+12. **Agents:** the model never approves anything. Tools must not mutate
+   in `prepare` (no side effects; return `Prepared::Ask` with a diff for
+   every write, `run_command`, install, or read outside the scope); the
+   host runs the `Action` only after the session says `Run`. Buffer edits
+   go through `EditorState::replace_ranges` (one undo step) and are rebased
+   by old text if the document changed (`re_agent_tools::buffer::rebase`).
+   Tool workers and provider events carry the live session's generation;
+   drop stale ones. Sending a conversation to a provider needs the
+   per-provider egress approval (`ProviderConfig::egress_key`). Custom
+   agents run only after their plugin approval. `ext_*` tools are only
+   given to the built-in Extension Builder. Tests use `ScriptedProvider`
+   and isolated folders (`agent_setup`); never let a test write to the real
+   config/approvals (pass explicit paths to `load_plugins`).
 
 Whole-file JSON/case transforms and copying a document-wide selection do
 materialize text; that is an accepted, documented cost.

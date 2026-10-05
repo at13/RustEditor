@@ -18,7 +18,7 @@ extensions = ["txt", "log", "json", "csv", "md", "xml", "yaml", "yml", "toml", "
 mime_types = ["text/plain"]
 
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "providers/*"]
 resolver = "3"
 
 [workspace.package]
@@ -33,7 +33,10 @@ heck = "0.5.0"
 memchr = "2.7"
 regex = "1.13.1"
 ropey = "1.6.1"
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
+re-agent = { path = "crates/re-agent" }
+re-agent-tools = { path = "crates/re-agent-tools" }
 re-commands = { path = "crates/re-commands" }
 re-core = { path = "crates/re-core" }
 re-platform = { path = "crates/re-platform" }
@@ -53,6 +56,8 @@ wasm-plugins = ["re-plugin/wasm"]
 [dependencies]
 anyhow.workspace = true
 gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
+re-agent.workspace = true
+re-agent-tools.workspace = true
 re-commands.workspace = true
 re-core.workspace = true
 re-ext-calculator.workspace = true
@@ -64,6 +69,7 @@ re-tasks.workspace = true
 re-view.workspace = true
 rfd = "0.17.2"
 ropey.workspace = true
+serde_json.workspace = true
 
 # GPUI is built without default features (keeps the Windows binary small),
 # so each platform must enable its own text/window backends. Without these,

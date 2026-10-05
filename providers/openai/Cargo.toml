@@ -1,0 +1,11 @@
+[package]
+name = "rusteditor-openai"
+edition.workspace = true
+version.workspace = true
+publish = false
+description = "RustEditor model provider for OpenAI-compatible chat APIs (OpenAI, Azure OpenAI, Ollama, LM Studio, ...)"
+
+[dependencies]
+re-agent.workspace = true
+serde_json.workspace = true
+ureq = { version = "2.12", default-features = false, features = ["tls"] }

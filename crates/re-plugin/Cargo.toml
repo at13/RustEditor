@@ -11,6 +11,8 @@ wasm = ["dep:wasmi"]
 
 [dependencies]
 anyhow.workspace = true
+re-ext-transforms.workspace = true
+regex.workspace = true
 serde_json.workspace = true
 wasmi = { version = "0.51.5", default-features = false, features = ["std"], optional = true }
 
