@@ -4,5 +4,7 @@
 //! This is the only crate (besides the GPUI frontend) that contains
 //! OS-specific code; everything is behind `#[cfg]` here.
 
+pub mod child_lifetime;
+pub mod credentials;
 pub mod instance;
 pub mod paths;

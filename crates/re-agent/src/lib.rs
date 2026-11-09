@@ -17,6 +17,7 @@ pub mod protocol;
 pub mod provider;
 pub mod schema;
 pub mod session;
+pub mod setup;
 pub mod store;
 pub mod tools;
 

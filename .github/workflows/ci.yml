@@ -38,6 +38,18 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: providers/copilot/package-lock.json
+      - name: Copilot SDK provider tests (no credentials or model requests)
+        working-directory: providers/copilot
+        env:
+          RUSTEDITOR_SDK_RUNTIME_SMOKE: '1'
+        run: |
+          npm ci
+          npm test
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -48,6 +60,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --quiet
+      - name: Copilot SDK stdio bridge (isolated Node fixture)
+        run: cargo test -p rusteditor-openai sdk_stdio_bridge -- --ignored
       - name: Core crates must not depend on the UI
         shell: bash
         run: |

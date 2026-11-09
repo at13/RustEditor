@@ -38,6 +38,7 @@ use re_tasks::{
 use crate::ai::{AiRequest, ProviderKind, SourceDocument};
 
 mod agent;
+mod provider_settings;
 use agent::{AgentMessage, AgentState};
 
 const PREVIEW_CHARS: usize = 1_024;
@@ -115,7 +116,7 @@ struct PluginState {
 impl gpui::Global for PluginState {}
 
 /// Approval key for sending document text to GitHub Copilot.
-const COPILOT_EGRESS_KEY: &str = "builtin:copilot:send-document";
+const COPILOT_EGRESS_KEY: &str = "builtin:copilot-sdk:send-document";
 
 /// Loads plugins from `dir` (default: `<config>/plugins`) and approvals
 /// from `approvals` (default: `<config>/approvals.txt`). Returns problems.
@@ -488,6 +489,7 @@ enum CommandMode {
     ReplaceAll,
     /// Typing a message in the agent panel.
     Agent,
+    ProviderSetting,
 }
 
 #[derive(Clone, Copy)]
@@ -1630,6 +1632,9 @@ impl Workspace {
     }
 
     fn select_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if matches!(self.command, Some(CommandMode::ProviderSetting)) {
+            self.cancel_command(cx);
+        }
         self.command = None;
         self.active = index;
         self.paint_cache.borrow_mut().rows.clear();
@@ -1821,6 +1826,9 @@ impl Workspace {
         cx.notify();
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.provider_secret_input() {
+            return;
+        }
         if self.command.is_some() {
             if !self.selected.is_empty() {
                 cx.write_to_clipboard(ClipboardItem::new_string(
@@ -1912,6 +1920,7 @@ impl Workspace {
             CommandMode::Replace | CommandMode::ReplaceAll => self.replacement.clone(),
             CommandMode::Ask
             | CommandMode::Agent
+            | CommandMode::ProviderSetting
             | CommandMode::Calculator
             | CommandMode::Palette
             | CommandMode::GoToLine => String::new(),
@@ -1935,6 +1944,10 @@ impl Workspace {
 
     fn finish_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let command = self.command;
+        if matches!(command, Some(CommandMode::ProviderSetting)) {
+            self.provider_apply_field(cx);
+            return;
+        }
         let input = self.content.clone();
         if matches!(command, Some(CommandMode::Agent)) {
             // Keep typing in the panel; the message goes to the agent.
@@ -1998,7 +2011,13 @@ impl Workspace {
                 self.replace_all(cx);
             }
             Some(CommandMode::GoToLine) => self.go_to_line(&input, cx),
-            Some(CommandMode::Calculator | CommandMode::Palette | CommandMode::Agent) | None => {}
+            Some(
+                CommandMode::Calculator
+                | CommandMode::Palette
+                | CommandMode::Agent
+                | CommandMode::ProviderSetting,
+            )
+            | None => {}
         }
     }
 
@@ -2043,7 +2062,7 @@ impl Workspace {
         match re_tasks::spawn(
             format!("rusteditor-ai-{tab_id}"),
             None,
-            move || ProviderKind::CopilotCli.ask(request),
+            move || ProviderKind::CopilotSdk.ask(request),
             move |result| {
                 let _ = sender.send(AiMessage { tab_id, result });
             },
@@ -2379,6 +2398,10 @@ impl Workspace {
     }
 
     fn escape_action(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.command, Some(CommandMode::ProviderSetting)) {
+            self.provider_settings_close(cx);
+            return;
+        }
         if self.command.is_some() {
             return self.cancel_command(cx);
         }
@@ -3649,7 +3672,11 @@ impl EntityInputHandler for Workspace {
         }
         let bytes = self.utf16_to_bytes(range);
         *actual = Some(self.to_utf16(bytes.clone()));
-        Some(self.content[bytes].to_owned())
+        Some(if self.provider_secret_input() {
+            "*".repeat(bytes.len())
+        } else {
+            self.content[bytes].to_owned()
+        })
     }
     fn selected_text_range(
         &mut self,
@@ -3692,6 +3719,18 @@ impl EntityInputHandler for Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if matches!(self.command, Some(CommandMode::ProviderSetting))
+            && self.agents.settings.field.is_none()
+        {
+            return;
+        }
+        if self.provider_secret_input()
+            && (!text.is_ascii() || text.len() > 2048 || text.contains(['\r', '\n']))
+        {
+            self.status = "API keys must be a single ASCII line (up to 2048 bytes)".into();
+            cx.notify();
+            return;
+        }
         if self.command.is_none() {
             if self.refuse_huge_edit(cx) {
                 return;
@@ -3741,6 +3780,18 @@ impl EntityInputHandler for Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if matches!(self.command, Some(CommandMode::ProviderSetting))
+            && self.agents.settings.field.is_none()
+        {
+            return;
+        }
+        if self.provider_secret_input()
+            && (!text.is_ascii() || text.len() > 2048 || text.contains(['\r', '\n']))
+        {
+            self.status = "API keys must be a single ASCII line (up to 2048 bytes)".into();
+            cx.notify();
+            return;
+        }
         if self.command.is_none() {
             self.edit(cx, |doc, editor| {
                 editor.replace_and_mark(doc, range, text, selection)
@@ -3890,7 +3941,11 @@ impl Element for LineElement {
         cx: &mut App,
     ) -> LinePaint {
         let state = self.workspace.read(cx);
-        let content: gpui::SharedString = state.content.clone().into();
+        let content: gpui::SharedString = if state.provider_secret_input() {
+            "*".repeat(state.content.len()).into()
+        } else {
+            state.content.clone().into()
+        };
         let style = window.text_style();
         let run = TextRun {
             len: content.len(),
@@ -4404,7 +4459,11 @@ impl Render for Workspace {
                     )),
             )
             .when(
-                self.command.is_some() && !matches!(self.command, Some(CommandMode::Agent)),
+                self.command.is_some()
+                    && !matches!(
+                        self.command,
+                        Some(CommandMode::Agent | CommandMode::ProviderSetting)
+                    ),
                 |root| {
                     root.child(
                         div()
@@ -4422,7 +4481,9 @@ impl Render for Workspace {
                                 Some(CommandMode::Calculator) => "Calculator:",
                                 Some(CommandMode::Replace) => "Replace match with:",
                                 Some(CommandMode::ReplaceAll) => "Replace all with:",
-                                Some(CommandMode::Agent) | None => "",
+                                Some(CommandMode::Agent | CommandMode::ProviderSetting) | None => {
+                                    ""
+                                }
                             })
                             .child(self.input_widget(cx))
                             .child(Self::toolbar_button(
@@ -6774,5 +6835,161 @@ b
         });
         assert!(provider.requests.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn provider_setup_masks_keys_and_never_sends_them_as_messages(cx: &mut gpui::TestAppContext) {
+        use provider_settings::Field;
+        use re_agent::setup::Kind;
+        let window = open_test_window(cx);
+        set_text(&window, cx, "private document\n");
+        let (provider, root) = agent_setup(&window, cx, "provider-settings", vec![]);
+        window
+            .update(cx, |editor, window, cx| {
+                editor.run_command("agent.providers", window, cx);
+                assert!(editor.agents.settings.open);
+                assert!(editor.json_viewer.is_none());
+                editor.provider_select(Kind::Anthropic, cx);
+                assert_eq!(editor.agents.settings.model, Kind::Anthropic.model());
+                editor.provider_edit(Field::Key, window, cx);
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_input("sk-test-do-not-store");
+        window
+            .update(&mut cx, |editor, window, cx| {
+                assert!(editor.provider_secret_input());
+                assert_eq!(editor.content, "sk-test-do-not-store");
+                let mut actual = None;
+                let masked = editor
+                    .text_for_range(0..editor.content.len(), &mut actual, window, cx)
+                    .unwrap();
+                assert_eq!(masked, "*".repeat(editor.content.len()));
+                cx.write_to_clipboard(ClipboardItem::new_string("safe".into()));
+                editor.selected = 0..editor.content.len();
+                editor.copy(&Copy, window, cx);
+                assert_eq!(
+                    cx.read_from_clipboard().unwrap().text().as_deref(),
+                    Some("safe")
+                );
+            })
+            .unwrap();
+        cx.simulate_keystrokes("enter");
+        // Applying a field must not hand keyboard input to the document.
+        cx.simulate_input("must not enter the document");
+        cx.simulate_keystrokes("enter");
+        window
+            .update(&mut cx, |editor, window, cx| {
+                assert!(editor.content.is_empty());
+                assert!(matches!(editor.command, Some(CommandMode::ProviderSetting)));
+                assert!(editor.agents.settings.field.is_none());
+                assert!(editor.agents.consent.is_none());
+                editor.provider_edit(Field::Model, window, cx);
+            })
+            .unwrap();
+        cx.simulate_input("claude-model-for-test");
+        cx.simulate_keystrokes("enter");
+        window
+            .update(&mut cx, |editor, _, _| {
+                assert_eq!(editor.agents.settings.model, "claude-model-for-test");
+            })
+            .unwrap();
+        cx.simulate_keystrokes("escape");
+        window
+            .update(&mut cx, |editor, _, _| {
+                assert!(!editor.agents.settings.open)
+            })
+            .unwrap();
+        assert!(provider.requests.lock().unwrap().is_empty());
+        assert_eq!(text(&window, &mut cx), "private document\n");
+        assert!(!root.join("data/conversations").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn provider_profiles_reload_and_saved_provider_becomes_default(cx: &mut gpui::TestAppContext) {
+        use re_agent::setup::Kind;
+        let window = open_test_window(cx);
+        let (_, root) = agent_setup(&window, cx, "provider-profiles", vec![]);
+        let profiles = root.join("providers");
+        re_agent::setup::save(
+            &profiles,
+            &Kind::OpenAi
+                .config("model-one", Path::new("test-helper"))
+                .unwrap(),
+        )
+        .unwrap();
+        re_agent::setup::save(
+            &profiles,
+            &Kind::Anthropic
+                .config("model-two", Path::new("test-helper"))
+                .unwrap(),
+        )
+        .unwrap();
+        window
+            .update(cx, |editor, _, cx| {
+                editor.agents.paths.providers = Some(profiles.clone());
+                editor.agent_providers(cx);
+                assert_eq!(editor.agents.default_provider.as_deref(), Some("anthropic"));
+                editor.provider_select(Kind::OpenAi, cx);
+                assert_eq!(editor.agents.settings.model, "model-one");
+                re_agent::setup::remove(&profiles, Kind::Anthropic).unwrap();
+                editor.agents.providers_loaded = false;
+                editor.refresh_agents(cx);
+                assert!(
+                    !editor
+                        .agents
+                        .providers
+                        .iter()
+                        .any(|p| p.config.id == "anthropic")
+                );
+            })
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn changing_provider_settings_between_tool_turns_needs_new_consent(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let window = open_test_window(cx);
+        set_text(&window, cx, "before");
+        let (provider, root) = agent_setup(
+            &window,
+            cx,
+            "settings-egress",
+            vec![
+                vec![
+                    tool_call(
+                        "e",
+                        "edit_buffer",
+                        serde_json::json!({"edits":[{"old_text":"before","new_text":"after"}]}),
+                    ),
+                    done(),
+                ],
+                say("Must not be sent without renewed consent"),
+            ],
+        );
+        window
+            .update(cx, |e, window, cx| {
+                e.agent_toggle_panel(window, cx);
+                allow_provider(e, cx);
+                e.agent_send("edit".into(), cx);
+            })
+            .unwrap();
+        wait_until(&window, cx, "edit approval", |e| pending_title(e).is_some());
+        window
+            .update(cx, |e, _, cx| {
+                e.agents.providers[0].config.model = "different-model".into();
+                e.agent_answer(true, cx);
+            })
+            .unwrap();
+        wait_until(&window, cx, "idle after settings change", agent_idle);
+        assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        assert_eq!(text(&window, cx), "after");
+        window.update(cx,|e,_,_| {
+            assert!(matches!(e.shown_live().unwrap().session.conversation.messages.last(),Some(re_agent::Message::Notice {text}) if text.contains("Provider settings changed")));
+        }).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

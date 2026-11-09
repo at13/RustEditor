@@ -6,7 +6,8 @@ set -eu
 bin_dir=${XDG_BIN_HOME:-"$HOME/.local/bin"}
 apps_dir=${XDG_DATA_HOME:-"$HOME/.local/share"}/applications
 
-rm -f "$bin_dir/rusteditor" "$apps_dir/rusteditor.desktop"
+rm -f "$bin_dir/rusteditor" "$bin_dir/rusteditor-openai" "$apps_dir/rusteditor.desktop"
+rm -rf "$bin_dir/copilot-sdk"
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$apps_dir" || true
 fi

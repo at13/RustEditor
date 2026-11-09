@@ -102,13 +102,12 @@ pub(super) struct ProviderEntry {
     pub provider: Arc<dyn Provider>,
 }
 
-/// `<config>/providers/*/provider.json`, plus the bundled OpenAI provider
-/// when `rusteditor-openai` sits next to the editor and a key is set.
+/// Profiles saved by the settings UI (legacy custom profiles still work).
 fn load_providers(dir: Option<&Path>) -> (Vec<ProviderEntry>, Vec<String>) {
     let (configs, errors) = dir
         .map(re_agent::provider::load_configs)
         .unwrap_or_default();
-    let mut entries: Vec<ProviderEntry> = configs
+    let entries: Vec<ProviderEntry> = configs
         .into_iter()
         .map(|config| ProviderEntry {
             provider: Arc::new(ProcessProvider {
@@ -117,29 +116,6 @@ fn load_providers(dir: Option<&Path>) -> (Vec<ProviderEntry>, Vec<String>) {
             config,
         })
         .collect();
-    let exe = format!("rusteditor-openai{}", std::env::consts::EXE_SUFFIX);
-    if let Some(sibling) = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join(&exe)))
-        .filter(|p| p.is_file())
-        && std::env::var_os("OPENAI_API_KEY").is_some()
-        && !entries.iter().any(|e| e.config.id == "openai")
-    {
-        let config = ProviderConfig {
-            id: "openai".into(),
-            name: "OpenAI".into(),
-            command: vec![sibling.to_string_lossy().into_owned()],
-            model: "gpt-4.1-mini".into(),
-            destination: "api.openai.com (OpenAI)".into(),
-            dir: PathBuf::new(),
-        };
-        entries.push(ProviderEntry {
-            provider: Arc::new(ProcessProvider {
-                config: config.clone(),
-            }),
-            config,
-        });
-    }
     (entries, errors)
 }
 
@@ -184,6 +160,13 @@ pub(super) struct Live {
 }
 
 pub(super) enum AgentMessage {
+    ProviderAuth {
+        result: String,
+    },
+    Settings {
+        id: String,
+        result: Result<String, String>,
+    },
     Model {
         key: u64,
         generation: u64,
@@ -227,11 +210,12 @@ pub(super) struct AgentState {
     pub consent: Option<Consent>,
     pub show_list: bool,
     pub list: Vec<Summary>,
-    sender: WakingSender<AgentMessage>,
+    pub(super) sender: WakingSender<AgentMessage>,
     pub receiver: Receiver<AgentMessage>,
     pub scroll: gpui::ScrollHandle,
     /// Second "Delete Agent Data" confirms.
     pub confirm_delete: bool,
+    pub settings: super::provider_settings::Settings,
 }
 
 impl AgentState {
@@ -256,6 +240,7 @@ impl AgentState {
             receiver,
             scroll: gpui::ScrollHandle::new(),
             confirm_delete: false,
+            settings: Default::default(),
         }
     }
 
@@ -355,6 +340,16 @@ impl Workspace {
             let (providers, errors) = load_providers(self.agents.paths.providers.as_deref());
             self.agents.providers = providers;
             self.agents.provider_errors = errors;
+            if let Some(id) = self
+                .agents
+                .paths
+                .providers
+                .as_deref()
+                .and_then(re_agent::setup::default_id)
+                && self.agents.providers.iter().any(|p| p.config.id == id)
+            {
+                self.agents.default_provider = Some(id);
+            }
             self.agents.providers_loaded = true;
         }
     }
@@ -612,8 +607,14 @@ impl Workspace {
     pub(super) fn agent_toggle_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.agents.open {
             self.agents.open = false;
-            if matches!(self.command, Some(CommandMode::Agent)) {
+            if matches!(
+                self.command,
+                Some(CommandMode::Agent | CommandMode::ProviderSetting)
+            ) {
                 self.cancel_command(cx);
+            }
+            if !self.agents.settings.busy {
+                self.agents.settings = Default::default();
             }
             cx.notify();
             return;
@@ -633,6 +634,12 @@ impl Workspace {
     }
 
     pub(super) fn agent_focus_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.agents.settings.open {
+            if self.agents.settings.busy {
+                return;
+            }
+            self.provider_settings_close(cx);
+        }
         if self.command.is_some() && !matches!(self.command, Some(CommandMode::Agent)) {
             self.cancel_command(cx);
         }
@@ -702,58 +709,16 @@ impl Workspace {
         self.handle_effects(key, effects, cx);
     }
 
-    #[inline(never)]
     pub(super) fn agent_providers(&mut self, cx: &mut Context<Self>) {
         self.agents.providers_loaded = false;
         self.refresh_agents(cx);
-        let dir = self.agents.paths.providers.clone();
-        if let Some(dir) = &dir {
-            let _ = std::fs::create_dir_all(dir);
+        if self.command.is_some() {
+            self.cancel_command(cx);
         }
-        let approvals = &cx.default_global::<PluginState>().approvals;
-        let mut text = String::from("Agent model providers\n=====================\n\n");
-        if self.agents.providers.is_empty() {
-            text.push_str("No providers are configured.\n");
-        }
-        for entry in &self.agents.providers {
-            let c = &entry.config;
-            text.push_str(&format!(
-                "{} ({}): model {}, sends to {}{}{}\n",
-                c.name,
-                c.id,
-                c.model,
-                c.destination,
-                if approvals.is_approved(&c.egress_key()) {
-                    ", allowed"
-                } else {
-                    ""
-                },
-                if self.agents.default_provider.as_deref() == Some(c.id.as_str()) {
-                    ", default"
-                } else {
-                    ""
-                }
-            ));
-        }
-        for error in &self.agents.provider_errors {
-            text.push_str(&format!("Problem: {error}\n"));
-        }
-        text.push_str(&format!(
-            "\nTo add one, create a folder in\n  {}\nwith a provider.json, for example (local Ollama):\n\n",
-            dir.as_deref()
-                .map_or_else(|| "(no config folder)".into(), |d| d.display().to_string())
-        ));
-        text.push_str(
-            "{\n  \"id\": \"ollama\",\n  \"name\": \"Ollama (local)\",\n  \"command\": [\"rusteditor-openai\", \"--base-url\", \"http://localhost:11434/v1\"],\n  \"model\": \"qwen2.5-coder\",\n  \"destination\": \"this computer\"\n}\n\n\
-             OpenAI: set OPENAI_API_KEY and use [\"rusteditor-openai\"] with a model such as gpt-4.1-mini.\n\
-             Azure OpenAI: [\"rusteditor-openai\", \"--base-url\", \"https://<resource>.openai.azure.com/openai/v1\", \"--api-key-env\", \"AZURE_OPENAI_API_KEY\", \"--auth-header\", \"api-key\"].\n\
-             API keys come from environment variables and never pass through the editor.\n\
-             Any program that speaks the provider protocol works (docs/design-proposal.md, 3.13.8).\n\
-             Use \"Next Provider\" in the agent panel to choose the default.\n",
-        );
-        self.json_viewer = Some(ropey::Rope::from_str(&text));
-        self.status = "Agent providers (read-only view)".into();
-        cx.notify();
+        self.agents.open = true;
+        self.agents.settings.open = true;
+        let kind = self.agents.settings.kind;
+        self.provider_select(kind, cx);
     }
 
     pub(super) fn agent_cycle_provider(&mut self, cx: &mut Context<Self>) {
@@ -954,7 +919,25 @@ impl Workspace {
         while let Some(effect) = queue.pop_front() {
             match effect {
                 Effect::Save => self.save_live(key),
-                Effect::StartModel(request) => self.start_model(key, request),
+                Effect::StartModel(request) => {
+                    // Settings can change between tool turns. Never inherit
+                    // consent for a different model/program/destination.
+                    let egress = self
+                        .agents
+                        .live(key)
+                        .and_then(|l| self.agents.provider(l.provider.as_deref()))
+                        .map(|p| p.config.egress_key());
+                    if egress.as_deref().is_some_and(|k| {
+                        !cx.default_global::<PluginState>().approvals.is_approved(k)
+                    }) {
+                        let more = self.agents.live_mut(key).map(|l| l.session.on_event(Event::Error {
+                            message: "Provider settings changed. Send another message to approve the new provider before continuing.".into(),
+                        })).unwrap_or_default();
+                        queue.extend(more);
+                    } else {
+                        self.start_model(key, request);
+                    }
+                }
                 Effect::Prepare(call) => queue.extend(self.prepare_call(key, call)),
                 Effect::Run { call_id } => queue.extend(self.run_action(key, &call_id, cx)),
                 Effect::Ask { call_id, approval } => {
@@ -1299,6 +1282,26 @@ impl Workspace {
         while let Ok(message) = self.agents.receiver.try_recv() {
             changed = true;
             match message {
+                AgentMessage::ProviderAuth { result } => {
+                    self.agents.settings.busy = false;
+                    self.agents.settings.notice = result;
+                }
+                AgentMessage::Settings { id, result } => {
+                    self.agents.settings.busy = false;
+                    let success = result.is_ok();
+                    self.agents.settings.notice = result.unwrap_or_else(|e| e);
+                    self.agents.providers_loaded = false;
+                    self.refresh_agents(cx);
+                    if success && self.agents.providers.iter().any(|p| p.config.id == id) {
+                        self.agents.default_provider = Some(id.clone());
+                        if let Some(key) = self.shown_key()
+                            && let Some(live) = self.agents.live_mut(key)
+                            && live.session.is_idle()
+                        {
+                            live.provider = Some(id);
+                        }
+                    }
+                }
                 AgentMessage::Model {
                     key,
                     generation,
@@ -1398,6 +1401,9 @@ impl Workspace {
 
     #[inline(never)]
     pub(super) fn render_agent_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.agents.settings.open {
+            return self.render_provider_settings(cx);
+        }
         let live = self.shown_live();
         let typing = matches!(self.command, Some(CommandMode::Agent));
         let busy = live.is_some_and(|l| !l.session.is_idle());

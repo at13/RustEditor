@@ -5,3 +5,9 @@ version.workspace = true
 publish = false
 
 [dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Security_Credentials", "Win32_System_JobObjects", "Win32_System_Threading"] }

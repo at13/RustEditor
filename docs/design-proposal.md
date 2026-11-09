@@ -651,9 +651,22 @@ Events (one JSON object per line on stdout):
 - Provider config lives in `<config>/providers/<id>/provider.json` (command
   line, model, endpoint description) like a process plugin; API keys come
   from the environment or the OS credential store, never from the editor's
-  files or conversations.
-- The existing "Ask Copilot" stays as a one-shot command: Copilot CLI runs
-  its own agent and cannot act as a tool-calling provider.
+  files or conversations. Agent > Providers now creates the built-in
+  profiles from UI controls: OpenAI/Anthropic (masked API-key entry,
+  editable default model), GitHub Copilot (CLI OAuth sign-in). Keys go to
+  the OS credential service with no plaintext fallback; configs only name
+  the credential, and the separate provider reads it. Save remembers the
+  default provider. Legacy custom profiles remain supported.
+- Both the File Agent's Copilot provider and one-shot Ask Copilot use the
+  official `@github/copilot-sdk` (separate Node package). Native streaming
+  events and registered tools replace the old CLI prompt/JSON adapter.
+  Tool callbacks are terminal, proposal-only queues: the editor owns
+  preparation, approval and execution. Empty mode excludes built-ins/MCP
+  and rejects permissions; ambient instructions, skills and file hooks are
+  disabled. The host transcript carries real results between fresh SDK
+  turns. SDK auth is checked before sending; the settings UI has a
+  document-free connection/auth check. Ask Copilot is read-only, bounded
+  to a 1 MiB worker snapshot; edits use the File Agent's approvals.
 
 #### 3.13.9 UI
 

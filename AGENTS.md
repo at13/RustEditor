@@ -3,6 +3,16 @@
 Guidance for coding agents working in this repository. Read `README.md` for
 user-facing behavior; this file covers architecture, invariants, and workflow.
 
+## Continuing work
+
+Read [docs/handoff.md](docs/handoff.md) at the start of a new session for the
+current workstream, last verified checks, known blockers, and next steps.
+Check `git status` and recent commits before acting; the handoff is a dated
+snapshot, not a substitute for inspecting the current worktree. Update it
+when handing off unfinished work, keeping task status there and durable
+architecture/workflow guidance here. Never put credentials or private
+conversation details in the handoff.
+
 ## Project summary
 
 RustEditor is a Windows, Notepad++-style text editor for very large files.
@@ -36,14 +46,17 @@ The repository is a Cargo workspace. The root package is the GPUI app
 | `crates/re-search/src/lib.rs` | Line-oriented search and replace engine (plain/regex, case) |
 | `crates/re-ext-transforms/src/lib.rs` | JSON view/format, Base64 decode, case conversions |
 | `crates/re-ext-calculator/src/lib.rs` | Arithmetic expression parser for the calculator overlay |
-| `src/ai.rs` | Copilot CLI provider; sends a temp snapshot of unsaved text |
+| `src/ai.rs` | Read-only Ask Copilot via the SDK provider; bounded worker snapshot of unsaved text |
 | `src/config.rs` | User keymap template (paths come from `re-platform`) |
 | `crates/re-plugin/` | `plugin.json` (`Manifest`, `Registry`; kinds `wasm`, `process`, `recipe`, `agent`; contributed `tools`), `protocol` (request/response JSON), `recipe` (declarative steps, run host-side), `wasm` (wasmi sandbox: only `env.log`, fuel + memory caps), `process` (stdin/stdout, timeout, output cap), `call_tool`, `approvals` |
 | `assets/agents/` | Built-in agents (`file-agent`, `extension-builder`): `*.json` (scope, tool allowlist) + system prompts, embedded with `include_str!`. The builder's prompt gets `docs/plugins.md` appended, so keep that doc accurate. Keep tool names in prompts, `*.json`, `re-agent-tools` and the design in sync |
 | `crates/re-agent/` | Agent core, UI-free: `session` (loop state machine returning `Effect`s), `conversation` + `store` (private per-user JSON, atomic), `tools` (`Tool`, `ToolRegistry`, `Risk`, `Approval`/`Remember`, `Action`), `schema` (argument validation), `protocol` + `provider` (JSON-lines provider programs, `ScriptedProvider` for tests), `diff`, `prompt` |
 | `crates/re-agent-tools/` | Built-in tools (`buffer`, `files`, `search`, `process`), scope checks (`scope`), Extension Builder tools (`ext`: staging, validate, test, install with `.history` rollback), plugin-contributed tools (`plugin`, named `<id>__<tool>`) |
 | `src/gpui_workspace/agent.rs` | Agent panel: `AgentState`, live sessions, provider runs, tool prepare/run on workers, approval/consent cards, applying `edit_buffer` edits |
-| `providers/openai/` | `rusteditor-openai`: OpenAI-compatible provider program (ureq + rustls); the editor itself never links an HTTP client of its own |
+| `providers/openai/` | `rusteditor-openai`: OpenAI-compatible + Anthropic Messages API + stdio bridge to the Copilot SDK Node provider (ureq + rustls); the editor never links an HTTP client of its own |
+| `providers/copilot/` | Official `@github/copilot-sdk` provider (TypeScript, pinned SDK/runtime). Native streaming events and tools; terminal proposal-only callbacks, short tool aliases, `mode: empty`, deny SDK permissions, no ambient tools/config discovery. Tests inject fake clients; optional real runtime smoke disables authentication and makes no model request |
+| `src/gpui_workspace/provider_settings.rs`, `crates/re-agent/src/setup.rs` | Provider setup UI and non-secret built-in profiles (OpenAI/Anthropic/Copilot), atomic profile/default writes |
+| `crates/re-platform/src/credentials.rs`, `child_lifetime.rs` | OS credential-store API (no plaintext fallback), launching Copilot OAuth, lifetime guards for provider-owned CLI children |
 | `docs/plugins.md`, `plugins/examples/` | Plugin author guide and the example WASM plugin (built separately for `wasm32-unknown-unknown`) |
 | `crates/re-platform/` | `paths` (config/runtime dirs, `ensure_private_dir`, `file_url_to_path`), `instance` (lock + named pipe / Unix socket forwarding). The only crate with OS-specific code besides GPUI |
 | `packaging/`, `scripts/install.sh` | Linux desktop entry and per-user install; macOS bundle notes (`[package.metadata.bundle]` in `Cargo.toml`) |
@@ -154,7 +167,12 @@ Preserve these when changing code:
    by old text if the document changed (`re_agent_tools::buffer::rebase`).
    Tool workers and provider events carry the live session's generation;
    drop stale ones. Sending a conversation to a provider needs the
-   per-provider egress approval (`ProviderConfig::egress_key`). Custom
+   per-provider egress approval (`ProviderConfig::egress_key`), checked on
+   every model turn because settings can change during a run. Provider keys
+   use OS credential storage (`re-platform::credentials`), not provider JSON,
+   argv, logs or conversations. Key entry is masked and Copy is blocked;
+   tests must not read/write the real key store or start real OAuth/model calls.
+   Custom
    agents run only after their plugin approval. `ext_*` tools are only
    given to the built-in Extension Builder. Tests use `ScriptedProvider`
    and isolated folders (`agent_setup`); never let a test write to the real

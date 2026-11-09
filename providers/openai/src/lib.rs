@@ -1,18 +1,20 @@
-//! RustEditor model provider for OpenAI-compatible chat completion APIs
-//! (OpenAI, Azure OpenAI, Ollama, LM Studio, vLLM, ...).
+//! RustEditor provider helper: OpenAI-compatible chat completion APIs,
+//! Anthropic Messages API, and a bridge to the GitHub Copilot SDK provider.
 //!
 //! Reads one `re_agent::protocol::ModelRequest` on stdin, calls
 //! `<base-url>/chat/completions` with streaming, and writes
 //! `re_agent::protocol::Event`s as JSON lines on stdout.
 //!
 //! ```text
-//! rusteditor-openai [--base-url URL] [--api-key-env NAME] [--auth-header NAME]
+//! rusteditor-openai [--backend openai|anthropic|copilot] [--credential ID]
+//!                   [--base-url URL] [--api-key-env NAME] [--auth-header NAME]
 //!                   [--model NAME] [--max-tokens-field NAME] [--no-usage]
 //! ```
 //!
-//! The API key is read from the environment (default `OPENAI_API_KEY`);
-//! it never passes through the editor. Without a key, requests go out with
-//! no authentication (fine for local servers such as Ollama).
+//! API keys are read from the OS credential store (`--credential`) or the
+//! environment (`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`), never from the
+//! protocol request. Without either option, unauthenticated local servers
+//! such as Ollama still work. Copilot uses the CLI's own authentication.
 
 use std::{
     collections::BTreeMap,
@@ -23,8 +25,15 @@ use std::{
 use re_agent::protocol::{Event, ModelRequest, WireMessage};
 use serde_json::{Value, json};
 
+mod anthropic;
+mod copilot;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
+    pub backend: String,
+    pub credential: Option<String>,
+    pub copilot_sdk: Option<String>,
+    pub check_auth: bool,
     pub base_url: String,
     pub api_key_env: String,
     pub auth_header: String,
@@ -36,6 +45,10 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            backend: "openai".into(),
+            credential: None,
+            copilot_sdk: None,
+            check_auth: false,
             base_url: "https://api.openai.com/v1".into(),
             api_key_env: "OPENAI_API_KEY".into(),
             auth_header: "Authorization".into(),
@@ -56,6 +69,10 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
                 .ok_or_else(|| format!("{arg} needs a value"))
         };
         match arg.as_str() {
+            "--backend" => options.backend = value()?,
+            "--credential" => options.credential = Some(value()?),
+            "--copilot-sdk" => options.copilot_sdk = Some(value()?),
+            "--check-auth" => options.check_auth = true,
             "--base-url" => options.base_url = value()?.trim_end_matches('/').to_owned(),
             "--api-key-env" => options.api_key_env = value()?,
             "--auth-header" => options.auth_header = value()?,
@@ -64,6 +81,18 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
             "--no-usage" => options.usage = false,
             other => return Err(format!("unknown argument {other}")),
         }
+    }
+    if !matches!(options.backend.as_str(), "openai" | "anthropic" | "copilot") {
+        return Err("unknown provider backend".into());
+    }
+    if options.backend == "anthropic" {
+        if options.base_url == "https://api.openai.com/v1" {
+            options.base_url = "https://api.anthropic.com/v1".into();
+        }
+        if options.api_key_env == "OPENAI_API_KEY" {
+            options.api_key_env = "ANTHROPIC_API_KEY".into();
+        }
+        options.auth_header = "x-api-key".into();
     }
     Ok(options)
 }
@@ -260,6 +289,23 @@ pub fn run(args: &[String], mut input: impl Read, mut out: impl Write) -> i32 {
         Ok(options) => options,
         Err(e) => return fail(&mut out, e),
     };
+    if options.check_auth {
+        if options.backend != "copilot" {
+            return fail(
+                &mut out,
+                "Auth check is only supported for Copilot SDK".into(),
+            );
+        }
+        return match copilot::run(
+            None,
+            options.copilot_sdk.as_deref().map(std::path::Path::new),
+            true,
+            &mut out,
+        ) {
+            Ok(()) => 0,
+            Err(e) => fail(&mut out, e),
+        };
+    }
     let mut text = String::new();
     if let Err(e) = input.read_to_string(&mut text) {
         return fail(&mut out, format!("cannot read the request: {e}"));
@@ -268,22 +314,64 @@ pub fn run(args: &[String], mut input: impl Read, mut out: impl Write) -> i32 {
         Ok(request) => request,
         Err(e) => return fail(&mut out, format!("invalid request: {e}")),
     };
-    let url = format!("{}/chat/completions", options.base_url);
+    if request.api != re_agent::API_VERSION {
+        return fail(&mut out, "unsupported provider protocol version".into());
+    }
+    if options.backend == "copilot" {
+        return match copilot::run(
+            Some(&request),
+            options.copilot_sdk.as_deref().map(std::path::Path::new),
+            false,
+            &mut out,
+        ) {
+            Ok(()) => 0,
+            Err(e) => fail(&mut out, e),
+        };
+    }
+    let anthropic = options.backend == "anthropic";
+    let url = format!(
+        "{}/{}",
+        options.base_url,
+        if anthropic {
+            "messages"
+        } else {
+            "chat/completions"
+        }
+    );
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(20))
         .timeout_read(Duration::from_secs(180))
         .build();
     let mut call = agent.post(&url).set("Content-Type", "application/json");
-    if let Ok(key) = std::env::var(&options.api_key_env)
-        && !key.is_empty()
-    {
+    if anthropic {
+        call = call.set("anthropic-version", "2023-06-01");
+    }
+    let key = match options.credential.as_deref() {
+        Some(id) => match re_platform::credentials::get(id) {
+            Ok(key) => key.or_else(|| std::env::var(&options.api_key_env).ok()),
+            Err(_) => match std::env::var(&options.api_key_env) {
+                Ok(key) if !key.is_empty() => Some(key),
+                _ => return fail(&mut out, "Cannot access the OS credential store. Update the key in provider settings or use the API-key environment variable.".into()),
+            },
+        },
+        None => std::env::var(&options.api_key_env).ok(),
+    };
+    if options.credential.is_some() && key.as_ref().is_none_or(String::is_empty) {
+        return fail(&mut out, "No API key. Add one in Agent > Providers.".into());
+    }
+    if let Some(key) = key.as_deref().filter(|k| !k.is_empty()) {
         call = if options.auth_header.eq_ignore_ascii_case("authorization") {
             call.set("Authorization", &format!("Bearer {key}"))
         } else {
-            call.set(&options.auth_header, &key)
+            call.set(&options.auth_header, key)
         };
     }
-    let response = match call.send_string(&body(&request, &options).to_string()) {
+    let request_body = if anthropic {
+        anthropic::body(&request, options.model.as_deref())
+    } else {
+        body(&request, &options)
+    };
+    let response = match call.send_string(&request_body.to_string()) {
         Ok(response) => response,
         Err(ureq::Error::Status(status, response)) => {
             let text = response.into_string().unwrap_or_default();
@@ -292,22 +380,42 @@ pub fn run(args: &[String], mut input: impl Read, mut out: impl Write) -> i32 {
                 .and_then(|v| v.get("error").map(error_message))
                 .unwrap_or_else(|| text.chars().take(500).collect());
             let hint = match status {
+                401 | 403 if options.credential.is_some() => {
+                    " (update the API key in Agent > Providers)".into()
+                }
                 401 | 403 => format!(" (check {})", options.api_key_env),
                 404 => " (check --base-url and the model name)".into(),
                 429 => " (rate limited; try again later)".into(),
                 _ => String::new(),
             };
+            let detail = key
+                .as_deref()
+                .filter(|k| !k.is_empty())
+                .map_or_else(|| detail.clone(), |key| detail.replace(key, "[redacted]"));
             return fail(&mut out, format!("HTTP {status}: {detail}{hint}"));
         }
-        Err(e) => return fail(&mut out, format!("cannot reach {url}: {e}")),
+        Err(e) => {
+            let message = format!("cannot reach {url}: {e}");
+            let message = key
+                .as_deref()
+                .filter(|k| !k.is_empty())
+                .map_or_else(|| message.clone(), |key| message.replace(key, "[redacted]"));
+            return fail(&mut out, message);
+        }
     };
     let mut stream = Stream::default();
+    let mut anthropic_stream = anthropic::Stream::default();
     for line in BufReader::new(response.into_reader()).lines() {
         let line = match line {
             Ok(line) => line,
             Err(e) => return fail(&mut out, format!("connection lost: {e}")),
         };
-        for event in stream.line(&line) {
+        let events = if anthropic {
+            anthropic_stream.line(&line)
+        } else {
+            stream.line(&line)
+        };
+        for event in events {
             let error = matches!(event, Event::Error { .. });
             if !emit(&mut out, &event) {
                 return 1;
@@ -316,9 +424,15 @@ pub fn run(args: &[String], mut input: impl Read, mut out: impl Write) -> i32 {
                 return 1;
             }
         }
-        if stream.done {
+        if stream.done || anthropic_stream.done {
             return 0;
         }
+    }
+    if anthropic {
+        return fail(
+            &mut out,
+            "Anthropic connection ended before message_stop".into(),
+        );
     }
     for event in stream.finish() {
         emit(&mut out, &event);
@@ -533,5 +647,80 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(run(&[], "not json".as_bytes(), &mut out), 1);
         assert!(String::from_utf8(out).unwrap().contains("invalid request"));
+    }
+
+    #[test]
+    fn anthropic_http_uses_messages_api_and_native_tool_schema() {
+        let (url, server) = serve(
+            "200 OK",
+            concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12}}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            ),
+        );
+        let input = serde_json::to_string(&request()).unwrap();
+        let args = [
+            "--backend",
+            "anthropic",
+            "--base-url",
+            &url,
+            "--api-key-env",
+            "RE_TEST_ANTHROPIC_KEY",
+        ]
+        .map(String::from);
+        // Unique fake key, never the user's credentials.
+        unsafe { std::env::set_var("RE_TEST_ANTHROPIC_KEY", "fake-test-key") };
+        let mut out = Vec::new();
+        assert_eq!(run(&args, input.as_bytes(), &mut out), 0);
+        let seen = server.join().unwrap();
+        assert!(seen.starts_with("POST /messages"), "{seen}");
+        assert!(seen.to_lowercase().contains("x-api-key: fake-test-key"));
+        assert!(
+            seen.to_lowercase()
+                .contains("anthropic-version: 2023-06-01")
+        );
+        let events: Vec<Event> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .filter_map(re_agent::protocol::parse_event)
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                Event::Text {
+                    delta: "hello".into()
+                },
+                Event::Usage {
+                    input_tokens: 12,
+                    output_tokens: 3
+                },
+                Event::Done {
+                    reason: "stop".into()
+                }
+            ]
+        );
+        let body: Value = serde_json::from_str(seen.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["tools"][0]["name"], "read_buffer");
+        assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "c1");
+    }
+
+    #[test]
+    fn api_error_diagnostics_do_not_echo_the_api_key() {
+        let (url, server) = serve(
+            "401 Unauthorized",
+            r#"{"error":{"message":"Invalid key test-key-that-must-not-appear"}}"#,
+        );
+        // Unique fake credential; never reads or changes the user's key.
+        unsafe { std::env::set_var("RE_TEST_REDACT_KEY", "test-key-that-must-not-appear") };
+        let args = ["--base-url", &url, "--api-key-env", "RE_TEST_REDACT_KEY"].map(str::to_owned);
+        let input = serde_json::to_string(&request()).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(run(&args, input.as_bytes(), &mut out), 1);
+        server.join().unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("test-key-that-must-not-appear"));
+        assert!(text.contains("[redacted]"));
     }
 }

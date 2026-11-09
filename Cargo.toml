@@ -19,6 +19,7 @@ mime_types = ["text/plain"]
 
 [workspace]
 members = ["crates/*", "providers/*"]
+exclude = ["providers/copilot"]
 resolver = "3"
 
 [workspace.package]

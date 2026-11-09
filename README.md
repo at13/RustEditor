@@ -60,9 +60,10 @@ lines can be copied, cut, deleted, or cleared.
 
 Use the **Scope** toggle to run JSON formatting/viewing, Base64 decoding,
 or case transformations on a selection or the complete document. **Copilot**
-opens a question field and displays the response in a read-only pane; the
-existing restricted Copilot CLI backend snapshots unsaved changes before
-asking. The first time, it asks before sending the file's text (including
+opens a question field and displays the response in a read-only pane. It
+uses the official Copilot SDK with a snapshot of unsaved text (up to 1 MiB);
+use the File Agent's range reads/search for larger files. It does not create
+or edit files; use the File Agent for approval-gated changes. The first time, it asks before sending the file's text (including
 unsaved edits) off the machine; run it again to allow. **Calculator** opens a keypad and expression field with arithmetic,
 parentheses, and precedence. Errors appear in the status bar.
 
@@ -95,13 +96,40 @@ recipes (lists of built-in text steps), WebAssembly, programs, or **custom
 agents** (a prompt plus a tool allowlist), and plugins can contribute
 **tools** that agents may call; see [docs/plugins.md](docs/plugins.md).
 Models are reached through **provider programs**, never by the editor
-itself: `rusteditor-openai` (built from `providers/openai`) talks to any
-OpenAI-compatible API, including local Ollama and Azure OpenAI; it is used
-automatically when it sits next to `rusteditor.exe` and `OPENAI_API_KEY` is
-set, and **Agent > Providers...** shows how to configure others. The first
-message to each provider asks before sending the conversation (and any file
-text the agent reads) off the machine. API keys stay in environment
-variables. Limits: providers are not yet tested against every service;
+itself. **Agent > Providers...** opens settings—no config-file editing is
+needed for **OpenAI**, **Anthropic**, or **GitHub Copilot**:
+
+- Choose OpenAI or Anthropic, click **Enter / replace API key**, paste your
+  key, press Enter, then **Save provider**. A default model is supplied;
+  **Edit model** lets you change it. Key entry is masked and cannot be copied
+  from the field. Keys are stored in Windows Credential Manager, macOS
+  Keychain, or Linux Secret Service (`secret-tool` required), never in
+  provider JSON or conversations. There is no plaintext fallback.
+  `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` still work if no stored key exists.
+- Choose GitHub Copilot and click **Sign in with GitHub**. The installed
+  Copilot CLI opens its own OAuth browser/terminal flow and manages its
+  credentials; a Copilot subscription and `copilot` on PATH are required.
+  If already signed in, just **Save provider**. RustEditor never reads the
+  Copilot token. **Check Copilot connection** verifies the SDK runtime and
+  authentication without sending document text. Inference uses the official
+  `@github/copilot-sdk`, its SDK-matched runtime, native streaming events,
+  and native registered tools—not CLI prompts or parsing assistant prose as
+  JSON. SDK tool callbacks only queue proposals; the editor still owns every
+  approval and execution. Built-in SDK tools, MCP servers, skills, file hooks
+  and ambient project instructions are disabled.
+- **Save provider** also makes it the startup default. **Remove provider**
+  removes its profile and stored API key (Copilot sign-out is managed by
+  its CLI). Custom OpenAI-compatible/local-provider JSON profiles still work.
+
+Build `cargo build --release -p rusteditor -p rusteditor-openai`; the helper
+`rusteditor-openai` supports all three backends and must sit next to the
+editor. The install scripts copy it when present, and build/install the
+separate `providers/copilot` Node package when Node.js/npm are available.
+The Copilot SDK needs Node.js 20.19+ or 22.12+; its dependencies and matched
+runtime are separate from the small editor executable. The first message to each
+provider still asks before sending the conversation (and any file text the
+agent reads) off the machine; changing its model requires renewed consent.
+ Limits: providers are not yet tested against every service;
 custom agents cannot add UI; the transcript renders plain text (no
 Markdown).
 
@@ -168,7 +196,7 @@ crates/               UI-independent crates (never depend on GPUI)
   re-agent/           Agent loop (state machine), conversations + store,
                       tool registry, risks, provider protocol and host
   re-agent-tools/     Built-in agent tools and the Extension Builder's tools
-providers/openai/     rusteditor-openai: OpenAI-compatible provider program
+providers/openai/     rusteditor-openai: OpenAI / Anthropic / Copilot helper
 plugins/examples/     Example plugin (Rust -> wasm32)
 packaging/            Linux .desktop entry, macOS bundle notes
   re-commands/        Command registry, platform-neutral keymaps, palette matching
@@ -264,7 +292,7 @@ To build and install the GPUI application on Windows, first close any running
 RustEditor window so Windows can replace the executable:
 
 ```powershell
-cargo build --release
+cargo build --release -p rusteditor -p rusteditor-openai
 .\scripts\install.ps1
 ```
 
@@ -277,7 +305,7 @@ installed executable.
 `.github/workflows/ci.yml`):
 
 ```sh
-cargo build --release
+cargo build --release -p rusteditor -p rusteditor-openai
 ./scripts/install.sh      # ~/.local/bin/rusteditor + app-menu entry
 ./scripts/uninstall.sh
 ```

@@ -4385,6 +4385,10 @@ dependencies = [
 [[package]]
 name = "re-platform"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "re-plugin"
@@ -4689,6 +4693,7 @@ name = "rusteditor-openai"
 version = "0.1.0"
 dependencies = [
  "re-agent",
+ "re-platform",
  "serde_json",
  "ureq",
 ]
